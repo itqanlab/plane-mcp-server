@@ -43,6 +43,7 @@ from plane_mcp.toolkit import (
     pql_failure,
     rich_text,
 )
+from plane_mcp.toolkit.pql_fallback import apply_fallback
 
 logger = get_logger(__name__)
 
@@ -301,7 +302,19 @@ def register(mcp: FastMCP) -> None:
                 if failure:
                     return failure
                 raise
-            return envelope(response, opt(fields))
+            page = envelope(response, opt(fields))
+            if pql:
+                # Some deployments (Plane Community) do not reject an unsupported `pql` —
+                # they return HTTP 200 with the whole board. Left alone, a dropped filter is
+                # indistinguishable from one that matched everything. Check, and say so.
+                outcome = apply_fallback(pql, page["results"])
+                page["results"] = outcome["rows"]
+                page["pql_applied"] = outcome["applied"]
+                if outcome.get("warning"):
+                    page["pql_warning"] = outcome["warning"]
+                if outcome["applied"] == "client":
+                    page["count"] = len(outcome["rows"])
+            return page
 
         if action == "count":
             scoped = _scoped_pql(pql, project_id)
