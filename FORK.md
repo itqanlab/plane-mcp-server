@@ -37,8 +37,15 @@ Forked from upstream `main` @ `ae6bad6`, version **0.3.2**.
 
 ## Why this fork exists — measured, not assumed
 
-Tested 2026-09-05 against a live self-hosted **Plane Community v1.3.1** instance (already the
-latest release — we cannot upgrade out of any of this), using MCP `0.3.2` + `plane-sdk 0.2.23/0.2.24`.
+Tested 2026-09-05 against a live self-hosted Plane Community instance, using MCP `0.3.2` +
+`plane-sdk 0.2.23/0.2.24`.
+
+> **Correction, later the same day.** An earlier draft said we were "already the latest release —
+> we cannot upgrade out of any of this". That was wrong. It came from the instance's own
+> `latest_version` field, which freezes at install time when telemetry is off (`last_checked_at`
+> was still 2026-06-27). We were on **1.3.1** while upstream was on **1.4.2** — three releases
+> behind, including a security release. **The instance has since been upgraded to 1.4.2.**
+> Never trust a self-hosted instance's self-reported "latest"; check upstream releases.
 
 ### Already fixed upstream — do NOT re-patch these
 
@@ -59,20 +66,40 @@ carried forward.
 
 | # | Item | Status | Where the fix belongs |
 |---|---|---|---|
-| 1 | **`pql` is silently ignored** | Confirmed on Community 1.3.1 | This repo — client-side fallback |
+| 1 | **`pql` ignored (1.3.1) / rejected (1.4.2)** | Edition-gated **by design** | This repo — client-side fallback |
 | 2 | **`relations.list()` raises `ValidationError`** | Confirmed on SDK **0.2.24** (latest) | `plane-python-sdk`; workaround here |
 | 3 | `count_workspace` → HTTP 404 | Community gap | This repo — count locally |
 | 4 | `advanced_search` → HTTP **403** | Edition-gated, not a bug | Not fixable |
 
-**On (1) — this is the big one.** Plane Community's public v1 issues endpoint has no
-server-side filtering. Measured on a 153-item board: `?state=<uuid>`, `?pql=...` and no filter
-returned **identical full boards** (153 rows, 13 actually matching). The MCP is not at fault —
-it sends `pql` correctly and even handles a `400` with a PQL error. Community just returns
-`200` with everything, so the caller cannot tell the filter was dropped. **A silently ignored
-filter is indistinguishable from a filter that matched everything**, which is how an agent ends
-up reviewing `Done` tickets believing they are open.
+**On (1) — read this before "fixing" it upstream.** Filtering is **deliberately excluded** from
+open-source Plane, not missing by accident. From `apps/api/plane/api/views/issue.py` on main:
 
-Every Community self-hoster has this. A client-side fallback in the server is the fix.
+```python
+unsupported_filters = [p for p in ("pql", "filters") if request.GET.get(p)]
+if unsupported_filters:
+    return Response({"pql":
+        "PQL and structured filters are not supported on this Plane edition. "
+        "Remove the pql/filters parameter and filter results client-side, or use "
+        "a Plane edition that supports work item query filtering."
+    }, status=400)
+```
+
+**Plane's own advice is "filter results client-side"** — exactly what our fallback does.
+
+Behaviour differs by version, and both are worth handling:
+
+| version | behaviour | why it matters |
+|---|---|---|
+| 1.3.1 (what we ran) | silent `200` + the whole board | worst case — a dropped filter looks identical to one that matched everything |
+| 1.4.2 (what we run now) | explicit `400` with the message above | loud and honest; already handled by `pql_failure()` |
+
+Upgrading turned a silent wrong answer into a clear error. The fallback still earns its place: it
+protects any deployment still on the old behaviour, and it is the documented remedy.
+
+**New finding while verifying the upgrade:** on 1.4.2 the MCP answers every rejected `pql` call
+with `PQL_FULL_REFERENCE` — about **4,000 tokens** of syntax guide — on an edition where PQL can
+never work. That waste repeats on every attempt. The response should detect "not supported on
+this Plane edition" and reply with one short line, no reference. Worth its own PR.
 
 **On (2):** `WorkItemRelationResponse` types its relation lists as `list[str]`; the API returns
 `list[dict]`. Any work item with a real relation fails to parse. Reproduced on
