@@ -10,6 +10,7 @@ from __future__ import annotations
 from typing import Any, Literal, get_args
 
 from fastmcp import FastMCP
+from plane.errors.errors import HttpError
 from plane.models.work_item_relation_definitions import (
     CreateWorkItemRelationDefinition,
     PaginatedWorkItemRelationDefinitionResponse,
@@ -102,6 +103,68 @@ def _all_definitions(client, workspace_slug: str, is_default, is_active) -> list
             return results
 
 
+HTTP_NOT_FOUND = 404
+
+# Relation kinds the legacy endpoint returns. Kept explicit so an unknown key is reported
+# rather than silently dropped.
+LEGACY_RELATION_KINDS = (
+    "blocking",
+    "blocked_by",
+    "duplicate",
+    "relates_to",
+    "start_after",
+    "start_before",
+    "finish_after",
+    "finish_before",
+)
+
+
+def _legacy_relations(client, workspace_slug: str, project_id: str, work_item_id: str):
+    """Read relations from the legacy endpoint, bypassing a broken SDK model.
+
+    Two separate problems make this necessary on older deployments:
+
+    1. `dependencies` and `custom_relations` do not exist there — both 404 — so the normal
+       path returns nothing at all and a work item with relations looks like one without.
+    2. The legacy endpoint DOES work, but `WorkItemRelationResponse` types its relation
+       lists as `list[str]` while the API returns `list[dict]`. Calling
+       `client.work_items.relations.list()` therefore raises ValidationError on any item
+       that actually has a relation. Confirmed on plane-sdk 0.2.23 and 0.2.24.
+
+    So we use the SDK's own transport and skip its model. Reaching for `_get` is not
+    something to do lightly, but the alternative is duplicating base-url and auth handling
+    here, which would drift. The real fix belongs in plane-sdk; when it lands, this whole
+    function should go.
+
+    Returns None if the legacy endpoint is missing too, so the caller re-raises the
+    original 404 rather than inventing an empty result.
+    """
+    try:
+        raw = client.work_items.relations._get(  # noqa: SLF001 - see docstring
+            f"{workspace_slug}/projects/{project_id}/work-items/{work_item_id}/relations"
+        )
+    except HttpError:
+        return None
+
+    if not isinstance(raw, dict):
+        return None
+
+    known = {kind: raw.get(kind) or [] for kind in LEGACY_RELATION_KINDS}
+    unknown = sorted(set(raw) - set(LEGACY_RELATION_KINDS))
+    result = {
+        "dependencies": known,
+        "custom": {},
+        "source": "legacy_relations_endpoint",
+        "note": (
+            "This deployment has no dependency or custom-relation endpoints, so relations were "
+            "read from the legacy endpoint. Custom relations are not available here."
+        ),
+    }
+    if unknown:
+        result["unrecognised_relation_kinds"] = unknown
+    return result
+
+
 def register(mcp: FastMCP) -> None:
     @mcp.tool(
         name=NAME,
@@ -183,12 +246,23 @@ def register(mcp: FastMCP) -> None:
             return error
 
         if action == "list":
-            dependencies = client.work_items.dependencies.list(
-                workspace_slug=workspace_slug, project_id=project_id, work_item_id=workitem_id
-            )
-            custom = client.work_items.custom_relations.list(
-                workspace_slug=workspace_slug, project_id=project_id, work_item_id=workitem_id
-            )
+            try:
+                dependencies = client.work_items.dependencies.list(
+                    workspace_slug=workspace_slug, project_id=project_id, work_item_id=workitem_id
+                )
+                custom = client.work_items.custom_relations.list(
+                    workspace_slug=workspace_slug, project_id=project_id, work_item_id=workitem_id
+                )
+            except HttpError as exc:
+                if exc.status_code != HTTP_NOT_FOUND:
+                    raise
+                # Older deployments (e.g. Plane Community) have no dependency or custom-relation
+                # endpoints. They do serve the legacy relations endpoint, so fall back to it
+                # rather than reporting a work item has no relations when it plainly does.
+                legacy = _legacy_relations(client, workspace_slug, project_id, workitem_id)
+                if legacy is None:
+                    raise
+                return legacy
             return {
                 "dependencies": dependencies.model_dump(),
                 "custom": {label: [item.model_dump() for item in items] for label, items in custom.items()},
