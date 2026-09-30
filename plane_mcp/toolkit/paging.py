@@ -118,6 +118,15 @@ def pql_failure(tool: str, action: str, pql: str, exc: HttpError) -> dict[str, A
     if detail is None:
         return None
     logger.warning("%s %s: invalid PQL %r -> %s", tool, action, pql, exc.response)
+    if "not supported on this plane edition" in str(detail).lower():
+        # Nothing in the PQL is wrong, so the 4,000-token reference would only invite a
+        # rewrite that can never succeed here. Say what works instead, in one line.
+        return {
+            "error": detail,
+            "failed_pql": pql,
+            "hint": f"This edition cannot filter server-side. {tool} {action} with a project_id "
+            "filters client-side instead; otherwise drop pql and filter the rows yourself.",
+        }
     return {
         "error": detail,
         "failed_pql": pql,
