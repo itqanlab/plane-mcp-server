@@ -44,7 +44,7 @@ from plane_mcp.toolkit import (
     rich_text,
 )
 from plane_mcp.toolkit.paging import dump_results
-from plane_mcp.toolkit.pql_fallback import apply_fallback, edition_refuses_pql, filter_board
+from plane_mcp.toolkit.pql_fallback import apply_fallback, count_board, edition_refuses_pql, filter_board
 
 logger = get_logger(__name__)
 
@@ -350,6 +350,22 @@ def register(mcp: FastMCP) -> None:
                 )
             except HttpError as exc:
                 failure = pql_failure("workitem", action, scoped, exc)
+                refused = failure is not None and edition_refuses_pql(failure["error"])
+                if project_id and (exc.status_code == 404 or refused):  # noqa: PLR2004
+                    # Community has no count endpoint (404) and refuses pql: count here.
+                    return count_board(
+                        lambda page_cursor: client.work_items.list(
+                            workspace_slug=workspace_slug,
+                            project_id=project_id,
+                            params=WorkItemQueryParams(
+                                per_page=100, cursor=page_cursor, fields="id,sequence_id,state,priority"
+                            ),
+                        ),
+                        lambda: client.states.list(workspace_slug=workspace_slug, project_id=project_id).results,
+                        pql,
+                        group_by,
+                        dump_results,
+                    )
                 if failure:
                     return failure
                 raise

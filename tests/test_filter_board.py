@@ -59,3 +59,13 @@ def test_unevaluable_pql_says_what_is_supported():
 def test_edition_refusal_is_recognised():
     assert edition_refuses_pql("PQL and structured filters are not supported on this Plane edition.")
     assert not edition_refuses_pql("Invalid PQL near 'stat'")
+
+
+def test_count_groups_by_state_name_and_group():
+    from plane_mcp.toolkit.pql_fallback import count_board
+
+    states = [NS(id=TODO, name="Todo", group="unstarted"), NS(id=DONE, name="Done", group="completed")]
+    by_name = count_board(lambda cur: PAGES[cur], lambda: states, "", "state_id", dump_results)
+    assert by_name["total"] == 4 and by_name["groups"] == {"Todo": 3, "Done": 1}
+    high = count_board(lambda cur: PAGES[cur], lambda: states, 'priority = "high"', "state__group", dump_results)
+    assert high["total"] == 3 and high["groups"] == {"unstarted": 2, "completed": 1}
