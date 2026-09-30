@@ -217,7 +217,7 @@ def filter_board(list_page, list_states, pql: str, fields: str | None, dump) -> 
     the tool module so it can be tested without a server.
     """
     try:
-        clauses = parse(pql)
+        clauses = parse(pql) if pql.strip() else []  # no pql: every row
     except Unevaluable as exc:
         return {
             "error": f"This Plane edition cannot filter server-side, and this pql cannot be "
@@ -258,3 +258,33 @@ def filter_board(list_page, list_states, pql: str, fields: str | None, dump) -> 
         "pql_applied": "client",
         "scanned": len(rows),
     }
+
+
+def count_board(list_page, list_states, pql: str, group_by: str, dump) -> dict[str, Any]:
+    """`count` for editions whose count endpoint is absent (Community answers 404).
+
+    Counts the rows `filter_board` returns. group_by `state_id` and `state__group` are
+    keyed by state name / group rather than uuid, so the answer reads without a lookup.
+    """
+    states = list(list_states())
+    page = filter_board(list_page, lambda: states, pql, "sequence_id,state,priority", dump)
+    if "error" in page:
+        return page
+    out: dict[str, Any] = {"total": page["count"], "counted": "client", "scanned": page["scanned"]}
+    if group_by:
+        by_id = {str(s.id): s for s in states}
+
+        def key(row: dict[str, Any]) -> str:
+            state = by_id.get(str(row.get("state")))
+            if group_by == "state_id":
+                return str(state.name) if state else str(row.get("state"))
+            if group_by == "state__group":
+                return str(getattr(state, "group", None) or "unknown")
+            return str(row.get(group_by.removesuffix("_id")) or "none")
+
+        groups: dict[str, int] = {}
+        for row in page["results"]:
+            groups[key(row)] = groups.get(key(row), 0) + 1
+        out["group_by"] = group_by
+        out["groups"] = dict(sorted(groups.items(), key=lambda kv: -kv[1]))
+    return out
