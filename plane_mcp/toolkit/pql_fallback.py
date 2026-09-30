@@ -172,3 +172,89 @@ def apply_fallback(pql: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
             "as complete."
         ),
     }
+
+
+# ---------------------------------------------------------------------------
+# Editions that REFUSE pql (Plane 1.4+ Community answers 400 "not supported on this
+# edition"). Plane's own advice is "filter results client-side", so do exactly that for
+# the subset above, instead of handing the caller a refusal and a 4,000-token syntax guide
+# for a language this edition will never accept.
+# ---------------------------------------------------------------------------
+
+EDITION_REFUSAL = "not supported on this plane edition"
+_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
+MAX_PAGES = 50  # 100 rows a page: a 5,000-item project is still one call
+
+
+def edition_refuses_pql(detail: Any) -> bool:
+    return EDITION_REFUSAL in str(detail).lower()
+
+
+def _resolve_state_names(clauses, state_ids_by_name: dict[str, str]):
+    """`state = "Todo"` is how people write it; rows carry the state's uuid."""
+    unknown: list[str] = []
+    resolved = []
+    for field, op, values in clauses:
+        if field == "state":
+            mapped = []
+            for value in values:
+                if _UUID.match(value):
+                    mapped.append(value)
+                elif value.lower() in state_ids_by_name:
+                    mapped.append(state_ids_by_name[value.lower()])
+                else:
+                    unknown.append(value)
+            values = mapped
+        resolved.append((field, op, values))
+    return resolved, unknown
+
+
+def filter_board(list_page, list_states, pql: str, fields: str | None, dump) -> dict[str, Any]:
+    """Every row of a project that matches `pql`, filtered here.
+
+    `list_page(cursor) -> response` fetches one page (no pql), `list_states() -> [state]`
+    lists the project's states and `dump(results, fields)` serialises a page. Kept free of
+    the tool module so it can be tested without a server.
+    """
+    try:
+        clauses = parse(pql)
+    except Unevaluable as exc:
+        return {
+            "error": f"This Plane edition cannot filter server-side, and this pql cannot be "
+            f"evaluated client-side ({exc}).",
+            "supported_here": 'field = "v", field != "v", field IN ("a","b"), NOT IN, joined by AND. '
+            "Fields: " + ", ".join(sorted(EVALUABLE_FIELDS)) + '. state accepts a name, e.g. state = "Todo".',
+        }
+    if any(field == "state" for field, _, _ in clauses):
+        names = {str(s.name).lower(): str(s.id) for s in list_states()}
+        clauses, unknown = _resolve_state_names(clauses, names)
+        if unknown:
+            return {"error": f"unknown state name(s): {unknown}", "known_states": sorted(names)}
+
+    wanted = None
+    if fields:
+        wanted = ",".join(sorted({*fields.split(","), *(f for f, _, _ in clauses)}))
+    rows: list[dict[str, Any]] = []
+    cursor = None
+    for _ in range(MAX_PAGES):
+        response = list_page(cursor)
+        rows.extend(dump(response.results, wanted))
+        if not getattr(response, "next_page_results", False) or not response.next_cursor:
+            break
+        cursor = response.next_cursor
+    else:
+        return {"error": f"project has more than {MAX_PAGES * 100} work items; narrow the request"}
+
+    matched = [r for r in rows if matches(r, clauses)]
+    if fields:
+        keep = {f.strip() for f in fields.split(",")}
+        matched = [{k: v for k, v in r.items() if k in keep} for r in matched]
+    return {
+        "results": matched,
+        "count": len(matched),
+        "total_count": len(matched),
+        "next_cursor": None,
+        "next_page_results": False,
+        "pql_applied": "client",
+        "scanned": len(rows),
+    }

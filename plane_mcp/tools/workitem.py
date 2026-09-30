@@ -43,7 +43,8 @@ from plane_mcp.toolkit import (
     pql_failure,
     rich_text,
 )
-from plane_mcp.toolkit.pql_fallback import apply_fallback
+from plane_mcp.toolkit.paging import dump_results
+from plane_mcp.toolkit.pql_fallback import apply_fallback, edition_refuses_pql, filter_board
 
 logger = get_logger(__name__)
 
@@ -305,6 +306,22 @@ def register(mcp: FastMCP) -> None:
                     response = client.work_items.list_workspace(workspace_slug=workspace_slug, params=params)
             except HttpError as exc:
                 failure = pql_failure("workitem", action, pql, exc)
+                if failure and action == "list" and project_id and edition_refuses_pql(failure["error"]):
+                    # Community 1.4+ refuses pql outright. Plane's own advice is to filter
+                    # client-side, so do it here rather than make every caller re-implement it.
+                    return filter_board(
+                        lambda page_cursor: client.work_items.list(
+                            workspace_slug=workspace_slug,
+                            project_id=project_id,
+                            params=WorkItemQueryParams(
+                                per_page=100, cursor=page_cursor, order_by=opt(order_by), expand=opt(expand)
+                            ),
+                        ),
+                        lambda: client.states.list(workspace_slug=workspace_slug, project_id=project_id).results,
+                        pql,
+                        opt(fields),
+                        dump_results,
+                    )
                 if failure:
                     return failure
                 raise
