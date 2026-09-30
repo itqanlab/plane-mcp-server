@@ -7,8 +7,36 @@ from fastmcp.server.auth.auth import AccessToken
 from fastmcp.server.dependencies import get_access_token
 from fastmcp.utilities.logging import get_logger
 from plane import PlaneClient
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 logger = get_logger(__name__)
+
+# A self-hosted Plane throttles API keys (API_KEY_RATE_LIMIT, 60/minute by default), and an
+# agent reading or writing a board in a burst hits it within seconds. `plane-sdk` can retry,
+# but `PlaneClient` never passes a retry config to its resources, so every 429 surfaced as a
+# failed tool call. Only 429 is retried: it means the request was refused before it ran, so
+# retrying is safe for POST too. 5xx is not, because a POST may already have applied.
+RATE_LIMIT_RETRY = Retry(
+    total=4,
+    status_forcelist=(429,),
+    allowed_methods=None,
+    backoff_factor=2,
+    respect_retry_after_header=True,
+    raise_on_status=False,
+)
+
+
+def retry_on_rate_limit(client: Any) -> Any:
+    """Mount the 429 retry on every resource session the client (and its v2 namespace) holds."""
+    adapter = HTTPAdapter(max_retries=RATE_LIMIT_RETRY)
+    for holder in (client, getattr(client, "v2", None)):
+        for resource in vars(holder or object()).values():
+            session = getattr(resource, "session", None)
+            if session is not None:
+                session.mount("https://", adapter)
+                session.mount("http://", adapter)
+    return client
 
 
 class PlaneClientContext(NamedTuple):
@@ -94,6 +122,6 @@ def get_plane_client_context() -> PlaneClientContext:
         )
 
     return PlaneClientContext(
-        client=client,
+        client=retry_on_rate_limit(client),
         workspace_slug=workspace_slug,
     )
