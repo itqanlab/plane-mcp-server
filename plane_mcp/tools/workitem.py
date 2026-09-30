@@ -143,7 +143,24 @@ GROUP_BY_VALUES = (
     "start_date",
 )
 
+# A full work item row is ~3.7 KB, almost all of it description_html. An agent listing a
+# board to decide what to pick needs none of that: 20 rows were 75 KB measured on a live
+# board. List rows are compact unless the caller asks, and writes confirm instead of echoing.
+COMPACT_ROW = "id,sequence_id,name,state,priority,parent,labels,assignees,target_date,updated_at"
+WRITE_ECHO = ("id", "sequence_id", "name", "state", "priority", "parent", "updated_at")
+
+
+def _confirm(item: Any) -> dict[str, Any]:
+    """What a write needs to confirm: the item and the fields that decide what it is now."""
+    data = item.model_dump() if hasattr(item, "model_dump") else dict(item or {})
+    out = {field: data.get(field) for field in WRITE_ECHO}
+    out["description_chars"] = len(data.get("description_html") or "")
+    return out
+
+
 FOOTER = (
+    "list returns compact rows (" + COMPACT_ROW + ") unless fields is given; fields=all returns "
+    "every field. create and update return a short confirmation; retrieve for the full item.\n"
     f"priority: {', '.join(PRIORITIES)}.\n"
     "UUID fields (assignees, labels, state, parent, type_id) need UUIDs -- list the relevant "
     "resource first if you only have a name.\n"
@@ -283,6 +300,7 @@ def register(mcp: FastMCP) -> None:
         if action in ("list", "list_archived"):
             if action == "list_archived" and not project_id:
                 return missing(action, "project_id")
+            fields = "" if fields == "all" else (fields or COMPACT_ROW)
             params = WorkItemQueryParams(
                 pql=opt(pql),
                 order_by=opt(order_by),
@@ -398,10 +416,12 @@ def register(mcp: FastMCP) -> None:
         if action == "create":
             if not name:
                 return missing(action, "name")
-            return client.work_items.create(
-                workspace_slug=workspace_slug,
-                project_id=project_id,
-                data=CreateWorkItem(**write_payload()),
+            return _confirm(
+                client.work_items.create(
+                    workspace_slug=workspace_slug,
+                    project_id=project_id,
+                    data=CreateWorkItem(**write_payload()),
+                )
             )
 
         if not workitem_id:
@@ -416,11 +436,13 @@ def register(mcp: FastMCP) -> None:
             )
 
         if action == "update":
-            return client.work_items.update(
-                workspace_slug=workspace_slug,
-                project_id=project_id,
-                work_item_id=workitem_id,
-                data=UpdateWorkItem(**write_payload()),
+            return _confirm(
+                client.work_items.update(
+                    workspace_slug=workspace_slug,
+                    project_id=project_id,
+                    work_item_id=workitem_id,
+                    data=UpdateWorkItem(**write_payload()),
+                )
             )
 
         if action == "delete":
