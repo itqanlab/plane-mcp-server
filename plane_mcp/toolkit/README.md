@@ -5,6 +5,8 @@ Shared building blocks for the tool surface, split by *when* they act. All re-ex
 | Module | Acts at | Provides |
 |---|---|---|
 | `spec.py` | declaration | `Action`, `build_description`, `build_annotations` |
+| `text.py` | response | `plain_text`, `truncate` |
+| `identifiers.py` | call | `split_identifier` |
 | `runtime.py` | call | `missing`, `needs`, `require`, `one_of`, `opt`, `coerce_list`, `page_params`, `as_params`, `ids_of` |
 | `mentions.py` | call | `render_mentions`, `tokenize_mentions`, `mention_user_ids`, `project_mention_error` |
 | `paging.py` | response | `envelope`, `dump_results`, `pql_failure`, `workitem_page` |

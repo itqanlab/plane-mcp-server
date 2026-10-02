@@ -43,8 +43,10 @@ from plane_mcp.toolkit import (
     pql_failure,
     rich_text,
 )
+from plane_mcp.toolkit.identifiers import split_identifier
 from plane_mcp.toolkit.paging import dump_results
 from plane_mcp.toolkit.pql_fallback import apply_fallback, count_board, edition_refuses_pql, filter_board
+from plane_mcp.toolkit.text import DEFAULT_BODY_CHARS, plain_text, truncate
 
 logger = get_logger(__name__)
 
@@ -93,6 +95,13 @@ ACTIONS = (
         ("workitem_identifier",),
         ("expand", "fields", "external_id", "external_source", "order_by"),
         note="identifier is PROJECT-N, e.g. ENG-42",
+        read=True,
+    ),
+    Action(
+        "body",
+        ("workitem_identifier",),
+        ("chars",),
+        note="the description as plain text with its state name, cut to chars (default 1500, 0 for all)",
         read=True,
     ),
     Action("search", ("query",), ("expand", "fields", "external_id", "external_source", "order_by"), read=True),
@@ -209,6 +218,38 @@ LEGACY = {
 }
 
 
+BODY_FIELDS = "name,state,priority,updated_at,description_html"
+
+
+def _body(client: Any, workspace_slug: str, identifier: str, head: str, sequence: int, chars: int | None) -> Any:
+    """One ticket's description as plain text, with what decides whether to read further."""
+    try:
+        item = client.work_items.retrieve_by_identifier(
+            workspace_slug=workspace_slug,
+            project_identifier=head,
+            issue_identifier=sequence,
+            params=RetrieveQueryParams(fields=BODY_FIELDS, expand="state"),
+        )
+    except HttpError as exc:
+        if exc.status_code == 404:  # noqa: PLR2004
+            return f"Error: work item {identifier} not found."
+        raise
+    data = item.model_dump(include={"name", "state", "priority", "updated_at", "description_html"})
+    state = data.get("state")
+    text = plain_text(data.get("description_html"))
+    shown, truncated = truncate(text, DEFAULT_BODY_CHARS if chars is None else chars)
+    return {
+        "identifier": identifier.strip().upper(),
+        "name": data.get("name"),
+        "state": state.get("name") if isinstance(state, dict) else state,
+        "priority": data.get("priority"),
+        "updated_at": data.get("updated_at"),
+        "text_chars": len(text),
+        "truncated": truncated,
+        "text": shown,
+    }
+
+
 def _scoped_pql(pql: str, project_id: str) -> str:
     """Narrow a PQL filter to one project, since the count endpoint is workspace-wide."""
     if not project_id:
@@ -229,6 +270,7 @@ def register(mcp: FastMCP) -> None:
             "list_archived",
             "retrieve",
             "retrieve_by_identifier",
+            "body",
             "search",
             "count",
             "create",
@@ -270,6 +312,8 @@ def register(mcp: FastMCP) -> None:
         fields: str = "",
         cursor: str = "",
         per_page: int = 0,
+        # None means the default length; 0 is a real value meaning "no cap".
+        chars: int | None = None,
         # Tri-state: False publishes a draft, unset leaves the flag alone.
         is_draft: bool | None = None,
         archive: bool | None = None,
@@ -413,20 +457,20 @@ def register(mcp: FastMCP) -> None:
                 return missing(action, "query")
             return client.work_items.search(workspace_slug=workspace_slug, query=query, params=retrieve_params())
 
-        if action == "retrieve_by_identifier":
+        if action in ("retrieve_by_identifier", "body"):
             if not workitem_identifier:
                 return missing(action, "workitem_identifier")
-            head, _, sequence = workitem_identifier.rpartition("-")
-            if not head or not sequence.isdigit():
-                return (
-                    f"Error: invalid work item identifier {workitem_identifier!r}. "
-                    "Expected PROJECT-N, for example ENG-42."
-                )
+            parsed = split_identifier(workitem_identifier)
+            if isinstance(parsed, str):
+                return parsed
+            head, sequence = parsed
+            if action == "body":
+                return _body(client, workspace_slug, workitem_identifier, head, sequence, chars)
             return _sparse(
                 client.work_items.retrieve_by_identifier(
                     workspace_slug=workspace_slug,
                     project_identifier=head,
-                    issue_identifier=int(sequence),
+                    issue_identifier=sequence,
                     params=retrieve_params(),
                 ),
                 fields,
