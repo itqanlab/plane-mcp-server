@@ -14,7 +14,7 @@ NAME = "label"
 TITLE = "Labels"
 
 ACTIONS = (
-    Action("list", ("project_id",), ("cursor", "per_page"), read=True),
+    Action("list", ("project_id",), ("cursor", "per_page", "fields"), read=True),
     Action("retrieve", ("project_id", "label_id"), read=True),
     Action(
         "create",
@@ -30,7 +30,15 @@ ACTIONS = (
     Action("delete", ("project_id", "label_id"), destructive=True),
 )
 
-FOOTER = "color is a hex code such as #EF4444. parent is the UUID of another label, for nesting."
+# A full label row is ~580 bytes, nearly all timestamps and owner ids. An agent resolving a
+# label name to its id needs none of that.
+COMPACT_ROW = "id,name,parent,color"
+
+FOOTER = (
+    "list returns compact rows (" + COMPACT_ROW + ") unless fields is given; fields=all returns "
+    "every field.\n"
+    "color is a hex code such as #EF4444. parent is the UUID of another label, for nesting."
+)
 
 LEGACY = {
     "list_labels": "list",
@@ -61,6 +69,7 @@ def register(mcp: FastMCP) -> None:
         external_id: str = "",
         cursor: str = "",
         per_page: int = 0,
+        fields: str = "",
     ) -> Label | dict[str, Any] | str | None:
         client, workspace_slug = get_plane_client_context()
 
@@ -73,7 +82,7 @@ def register(mcp: FastMCP) -> None:
                 project_id=project_id,
                 params=page_params(cursor, per_page),
             )
-            return envelope(response)
+            return envelope(response, None if fields == "all" else (fields or COMPACT_ROW))
 
         if action == "create":
             if not name:

@@ -39,7 +39,11 @@ assert SETTABLE_GROUPS == get_args(CatalogGroupEnum)
 
 ACTIONS = (
     Action(
-        "list", (), ("project_id", "cursor", "per_page"), note="workspace scope when project_id is omitted", read=True
+        "list",
+        (),
+        ("project_id", "cursor", "per_page", "fields"),
+        note="workspace scope when project_id is omitted",
+        read=True,
     ),
     Action("retrieve", ("state_id",), ("project_id",), read=True),
     Action(
@@ -57,7 +61,13 @@ ACTIONS = (
     Action("delete", ("state_id",), ("project_id",), destructive=True),
 )
 
+# A full state row is ~520 bytes, nearly all timestamps, owner ids and external ids. An agent
+# resolving a state name to its id needs none of that.
+COMPACT_ROW = "id,name,group,sequence,default"
+
 FOOTER = (
+    "list returns compact rows (" + COMPACT_ROW + ") unless fields is given; fields=all returns "
+    "every field.\n"
     f"group is one of: {', '.join(SETTABLE_GROUPS)}. color is a hex code such as #EF4444. "
     "A project also has a triage state, but Plane owns it: it cannot be created here and is "
     "not listed, and Triage is a reserved name. "
@@ -124,6 +134,7 @@ def register(mcp: FastMCP) -> None:
         external_id: str = "",
         cursor: str = "",
         per_page: int = 0,
+        fields: str = "",
     ) -> State | dict[str, Any] | str | None:
         client, workspace_slug = get_plane_client_context()
         scope = _scope_of(client, project_id)
@@ -153,7 +164,7 @@ def register(mcp: FastMCP) -> None:
             response: PaginatedStateResponse = scope.namespace.list(
                 workspace_slug=workspace_slug, **scope.kwargs, params=page_params(cursor, per_page)
             )
-            return envelope(response)
+            return envelope(response, None if fields == "all" else (fields or COMPACT_ROW))
 
         if action == "create":
             if error := needs(action, name=name, color=color):
