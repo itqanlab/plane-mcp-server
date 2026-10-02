@@ -165,6 +165,38 @@ def _legacy_relations(client, workspace_slug: str, project_id: str, work_item_id
     return result
 
 
+REMOVE_UNSUPPORTED = (
+    "Error: this Plane deployment cannot remove relations through its API. It has no "
+    "dependency or custom-relation endpoints, and the legacy relations endpoint only lists "
+    "and creates (checked against Plane 1.4.2; removal exists only in the web app, behind a "
+    "browser session). Nothing was changed. Remove the relation in the Plane web UI."
+)
+
+
+def _remove_relation(client, workspace_slug, project_id, work_item_id, related_work_item_id, is_dependency):
+    """Remove one relation, or say plainly that this deployment cannot.
+
+    On deployments without the dependency endpoints (e.g. Plane Community) both remove
+    calls 404, and a bare 404 reads like "relation not found". It is not: the relation is
+    there, the API just has no way to delete it. Report that instead.
+    """
+    remove = client.work_items.dependencies.remove if is_dependency else client.work_items.custom_relations.remove
+    try:
+        remove(
+            workspace_slug=workspace_slug,
+            project_id=project_id,
+            work_item_id=work_item_id,
+            related_work_item_id=related_work_item_id,
+        )
+    except HttpError as exc:
+        if exc.status_code != HTTP_NOT_FOUND:
+            raise
+        if _legacy_relations(client, workspace_slug, project_id, work_item_id) is None:
+            raise
+        return REMOVE_UNSUPPORTED
+    return None
+
+
 def register(mcp: FastMCP) -> None:
     @mcp.tool(
         name=NAME,
@@ -303,11 +335,4 @@ def register(mcp: FastMCP) -> None:
 
         if not related_workitem_id:
             return missing(action, "related_workitem_id")
-        remove = client.work_items.dependencies.remove if is_dependency else client.work_items.custom_relations.remove
-        remove(
-            workspace_slug=workspace_slug,
-            project_id=project_id,
-            work_item_id=workitem_id,
-            related_work_item_id=related_workitem_id,
-        )
-        return None
+        return _remove_relation(client, workspace_slug, project_id, workitem_id, related_workitem_id, is_dependency)
