@@ -71,7 +71,7 @@ carried forward.
 | 3 | `count_workspace` → HTTP 404 | Community gap | This repo — count locally |
 | 4 | `advanced_search` → HTTP **403** | Edition-gated, not a bug | Not fixable |
 | 5 | `workitem_relation create` → HTTP 404 (no dependency endpoint) | Fixed 2026-10-02 (PMCP-13) | This repo — create through the legacy `relations/` endpoint, read back to confirm |
-| 6 | `workitem_relation delete` → bare HTTP 404 | Answered 2026-10-02 (PMCP-1) | Not fixable on the API key surface; removal is a web-session route only, so the tool says so |
+| 6 | `workitem_relation delete` → bare HTTP 404 | Fixed 2026-10-02 (PMCP-1, PMCP-9) | Not fixable on the API key surface. With `PLANE_SESSION_EMAIL` / `PLANE_SESSION_PASSWORD` set, the tool signs in as a bot user and calls the web app's `remove-relation/` (`plane_mcp/session.py`); without them it says removal is unsupported. `tests/test_session_live.py` (`PLANE_SESSION_LIVE=1`) checks the sign-in contract after a Plane upgrade |
 
 **On (1) — read this before "fixing" it upstream.** Filtering is **deliberately excluded** from
 open-source Plane, not missing by accident. From `apps/api/plane/api/views/issue.py` on main:

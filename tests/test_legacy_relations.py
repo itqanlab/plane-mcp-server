@@ -104,8 +104,9 @@ class TestRemoveRelation:
         assert _remove_relation(client, "ws", "p", "wi", "other", True) is None
         assert calls[0]["related_work_item_id"] == "other"
 
-    def test_404_on_a_legacy_deployment_says_removal_is_unsupported(self):
+    def test_404_on_a_legacy_deployment_says_removal_is_unsupported(self, monkeypatch):
         """A bare 404 reads like "relation not found"; the relation exists, the API can't delete it."""
+        monkeypatch.delenv("PLANE_SESSION_EMAIL", raising=False)
         client, _ = removal_client(HttpError(status_code=404, message="Not Found"), {"blocked_by": []})
         assert _remove_relation(client, "ws", "p", "wi", "other", True) == REMOVE_UNSUPPORTED
 
