@@ -1,0 +1,38 @@
+{
+  "plane": {
+    "workspace_slug": "itqan",
+    "project_id": "1310b51b-a99b-43af-947d-b45a7a89256b",
+    "identifier": "PMCP"
+  },
+
+  "git": {
+    "trunk": "main",
+    "remote": "origin",
+    "merge_strategy": "merge",
+    "branch_pattern": "<type>/PMCP-<n>-<slug>",
+    "notes": "Tracking fork of makeplane/plane-mcp-server. Run ./scripts/sync-upstream.sh before branching. PRs go to itqanlab/plane-mcp-server only, never upstream (push to upstream is disabled on purpose). One self-contained fix per commit so it can be upstreamed later (FORK.md)."
+  },
+
+  "quality": {
+    "pre_push": ".venv/bin/python -m pytest -q && .venv/bin/ruff check plane_mcp/ tests/ && .venv/bin/ruff format --check plane_mcp/",
+    "commit_style": "conventional"
+  },
+
+  "ci": {
+    "provider": "github-actions",
+    "required_green": false,
+    "notes": "The repo's workflows (build-branch.yml, publish-pypi.yml) are manual/release only; nothing runs on a PR. The local quality gate is the gate."
+  },
+
+  "deploy": {
+    "platform": "none",
+    "notes": "The MCP runs from this repo's .venv (~/.claude.json mcpServers.plane -> /Volumes/SanDiskSSD/mine/plane-mcp-server/.venv/bin/plane-mcp-server stdio). A merged change takes effect after the plane MCP reconnects (/mcp -> plane -> reconnect, or a new Claude Code session). Verify live by calling the changed tool through mcp__plane__* after the reconnect.",
+    "environments": []
+  },
+
+  "roles": [],
+
+  "verify": {
+    "how": "Unit tests with the SpyClient (tests/tools/) plus one live call of the changed action through the reconnected plane MCP against https://tasks.itqanlab.com (workspace itqan). Use the PMCP project itself as the test board; never write to client projects (HLMNA, DETALIA, ...) to test."
+  }
+}
