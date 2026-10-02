@@ -32,6 +32,7 @@ SAMPLES: dict[str, object] = {
     "network": 2,
     "timezone": "UTC",
     "workitem_identifier": "ENG-42",
+    "workitem_identifiers": ["ENG-42"],
     "kind": "workitem",
     "template_data": '{"name": "Spec"}',
 }

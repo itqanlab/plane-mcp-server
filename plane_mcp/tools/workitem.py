@@ -41,6 +41,7 @@ from plane_mcp.toolkit import (
     missing,
     one_of,
     opt,
+    page_params,
     pql_failure,
     rich_text,
 )
@@ -48,6 +49,16 @@ from plane_mcp.toolkit.identifiers import resolve_workitem, split_identifier
 from plane_mcp.toolkit.paging import dump_results
 from plane_mcp.toolkit.pql_fallback import apply_fallback, count_board, edition_refuses_pql, filter_board
 from plane_mcp.toolkit.text import DEFAULT_BODY_CHARS, ESCAPED_WARNING, looks_escaped, plain_text, truncate
+from plane_mcp.toolkit.triage import (
+    MAX_TICKETS,
+    SCHEMA_KEYWORDS,
+    cited_paths,
+    comment_facts,
+    decision_words,
+    flat,
+    keyword_hits,
+    vague_scope,
+)
 
 logger = get_logger(__name__)
 
@@ -103,6 +114,13 @@ ACTIONS = (
         ("workitem_identifier",),
         ("chars",),
         note="the description as plain text with its state name, cut to chars (default 1500, 0 for all)",
+        read=True,
+    ),
+    Action(
+        "triage",
+        ("workitem_identifiers",),
+        ("comments", "keywords", "path_prefixes"),
+        note="pre-pick facts for up to 25 PROJ-N tickets in one call; comments=true adds comment counts",
         read=True,
     ),
     Action("search", ("query",), ("expand", "fields", "external_id", "external_source", "order_by"), read=True),
@@ -288,6 +306,74 @@ def _body(client: Any, workspace_slug: str, identifier: str, head: str, sequence
     }
 
 
+COMMENT_PAGES = 5
+
+
+def _all_comments(client: Any, workspace_slug: str, project_id: str, workitem_id: str) -> list[Any]:
+    comments: list[Any] = []
+    cursor = ""
+    for _ in range(COMMENT_PAGES):
+        page = client.work_items.comments.list(
+            workspace_slug=workspace_slug,
+            project_id=project_id,
+            work_item_id=workitem_id,
+            params=page_params(cursor, 100),
+        )
+        comments.extend(page.results or [])
+        if not getattr(page, "next_page_results", False) or not getattr(page, "next_cursor", None):
+            break
+        cursor = page.next_cursor
+    return comments
+
+
+def _triage_row(
+    client: Any,
+    workspace_slug: str,
+    identifier: str,
+    with_comments: bool,
+    keywords: list[str],
+    prefixes: list[str],
+) -> dict[str, Any]:
+    """One ticket's Plane-side pre-pick facts. A ticket that fails to load says so; it never drops out."""
+    row: dict[str, Any] = {"identifier": str(identifier).strip().upper()}
+    parsed = split_identifier(str(identifier))
+    if isinstance(parsed, str):
+        return row | {"error": parsed.removeprefix("Error: ")}
+    head, sequence = parsed
+    try:
+        item = client.work_items.retrieve_by_identifier(
+            workspace_slug=workspace_slug,
+            project_identifier=head,
+            issue_identifier=sequence,
+            params=RetrieveQueryParams(fields=f"id,project,{BODY_FIELDS}", expand="state"),
+        )
+    except HttpError as exc:
+        return row | {"error": "not found" if exc.status_code == 404 else f"HTTP {exc.status_code}"}  # noqa: PLR2004
+    data = item.model_dump(include={"id", "project", "name", "state", "priority", "updated_at", "description_html"})
+    state = data.get("state")
+    text = plain_text(data.get("description_html"))
+    words = flat(text)
+    name = data.get("name") or ""
+    row |= {
+        "name": name,
+        "state": state.get("name") if isinstance(state, dict) else state,
+        "priority": data.get("priority"),
+        "updated_at": data.get("updated_at"),
+        "text_chars": len(text),
+        "keywords": keyword_hits(words, keywords),
+        "paths": cited_paths(words, prefixes),
+        "decision_words": decision_words(words),
+        "vague_scope": vague_scope(words, name),
+    }
+    if with_comments:
+        try:
+            found = _all_comments(client, workspace_slug, str(data.get("project")), str(data.get("id")))
+        except HttpError as exc:
+            return row | {"error": f"comments: HTTP {exc.status_code}"}
+        row |= comment_facts(found, data.get("updated_at"))
+    return row
+
+
 def _scoped_pql(pql: str, project_id: str) -> str:
     """Narrow a PQL filter to one project, since the count endpoint is workspace-wide."""
     if not project_id:
@@ -309,6 +395,7 @@ def register(mcp: FastMCP) -> None:
             "retrieve",
             "retrieve_by_identifier",
             "body",
+            "triage",
             "search",
             "count",
             "create",
@@ -352,6 +439,10 @@ def register(mcp: FastMCP) -> None:
         per_page: int = 0,
         # None means the default length; 0 is a real value meaning "no cap".
         chars: int | None = None,
+        workitem_identifiers: list[str] | None = None,
+        comments: bool = False,
+        keywords: list[str] | None = None,
+        path_prefixes: list[str] | None = None,
         # Tri-state: False publishes a draft, unset leaves the flag alone.
         is_draft: bool | None = None,
         archive: bool | None = None,
@@ -494,6 +585,20 @@ def register(mcp: FastMCP) -> None:
             if not query:
                 return missing(action, "query")
             return client.work_items.search(workspace_slug=workspace_slug, query=query, params=retrieve_params())
+
+        if action == "triage":
+            identifiers = coerce_list(workitem_identifiers) or []
+            if not identifiers:
+                return missing(action, "workitem_identifiers")
+            if len(identifiers) > MAX_TICKETS:
+                return f"Error: triage takes at most {MAX_TICKETS} work items per call; got {len(identifiers)}."
+            chosen = coerce_list(keywords) or list(SCHEMA_KEYWORDS)
+            rows = [
+                _triage_row(client, workspace_slug, ident, comments, chosen, coerce_list(path_prefixes) or [])
+                for ident in identifiers
+            ]
+            failed = sum(1 for row in rows if "error" in row)
+            return {"results": rows, "requested": len(rows), "failed": failed}
 
         if action in ("retrieve_by_identifier", "body"):
             if not workitem_identifier:
