@@ -7,6 +7,7 @@ merging them teaches the model to filter on a field the API rejects.
 
 from __future__ import annotations
 
+import re
 from typing import Annotated, Any, Literal, get_args
 
 from fastmcp import FastMCP
@@ -43,10 +44,10 @@ from plane_mcp.toolkit import (
     pql_failure,
     rich_text,
 )
-from plane_mcp.toolkit.identifiers import split_identifier
+from plane_mcp.toolkit.identifiers import resolve_workitem, split_identifier
 from plane_mcp.toolkit.paging import dump_results
 from plane_mcp.toolkit.pql_fallback import apply_fallback, count_board, edition_refuses_pql, filter_board
-from plane_mcp.toolkit.text import DEFAULT_BODY_CHARS, plain_text, truncate
+from plane_mcp.toolkit.text import DEFAULT_BODY_CHARS, ESCAPED_WARNING, looks_escaped, plain_text, truncate
 
 logger = get_logger(__name__)
 
@@ -112,7 +113,12 @@ ACTIONS = (
         read=True,
     ),
     Action("create", ("project_id", "name"), WRITE_FIELDS[1:]),
-    Action("update", ("project_id", "workitem_id"), WRITE_FIELDS, note="only the fields you pass are changed"),
+    Action(
+        "update",
+        optional=("project_id", "workitem_id", "workitem_identifier", *WRITE_FIELDS),
+        note="name the item by project_id + workitem_id or by workitem_identifier (PROJ-N), not both; "
+        "only the fields you pass are changed",
+    ),
     Action("delete", ("project_id", "workitem_id"), destructive=True),
     Action(
         "archive",
@@ -159,12 +165,40 @@ COMPACT_ROW = "id,sequence_id,name,state,priority,parent,labels,assignees,target
 WRITE_ECHO = ("id", "sequence_id", "name", "state", "priority", "parent", "updated_at")
 
 
-def _confirm(item: Any) -> dict[str, Any]:
-    """What a write needs to confirm: the item and the fields that decide what it is now."""
+def _confirm(item: Any, state_names: dict[str, str] | None = None) -> dict[str, Any]:
+    """What a write needs to confirm: the item and the fields that decide what it is now.
+
+    Names the state when the project's states are known, and flags a description that was
+    stored as escaped markup -- the write succeeds either way, so only the read-back can tell.
+    """
     data = item.model_dump() if hasattr(item, "model_dump") else dict(item or {})
     out = {field: data.get(field) for field in WRITE_ECHO}
+    if state_names is not None:
+        out["state_name"] = state_names.get(str(data.get("state")))
     out["description_chars"] = len(data.get("description_html") or "")
+    out["description_escaped"] = looks_escaped(data.get("description_html"))
+    if out["description_escaped"]:
+        out["warning"] = ESCAPED_WARNING.format(field="description_html")
     return out
+
+
+_UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
+
+
+def _project_states(client: Any, workspace_slug: str, project_id: str) -> dict[str, str]:
+    """State uuid -> name for one project."""
+    states = client.states.list(workspace_slug=workspace_slug, project_id=project_id).results
+    return {str(state.id): str(state.name) for state in states or []}
+
+
+def _state_id(state: str, state_names: dict[str, str]) -> str:
+    """A state given by uuid or by name (any case), as a uuid. Error string if unknown."""
+    if _UUID.match(state):
+        return state
+    by_name = {name.lower(): state_id for state_id, name in state_names.items()}
+    if state.strip().lower() in by_name:
+        return by_name[state.strip().lower()]
+    return f"Error: unknown state {state!r} on this project. Known states: {', '.join(sorted(state_names.values()))}."
 
 
 def _sparse(item: Any, fields: str, expand: str = "") -> Any:
@@ -185,8 +219,12 @@ FOOTER = (
     "every field. create and update return a short confirmation; retrieve for the full item. "
     "retrieve with fields returns only the requested keys.\n"
     f"priority: {', '.join(PRIORITIES)}.\n"
-    "UUID fields (assignees, labels, state, parent, type_id) need UUIDs -- list the relevant "
-    "resource first if you only have a name.\n"
+    "state takes a uuid or a state name (any case) on create and update; the other UUID fields "
+    "(assignees, labels, parent, type_id) need UUIDs -- list the relevant resource first if you "
+    "only have a name. update also takes workitem_identifier (PROJ-N) in place of project_id + "
+    "workitem_id. A create or update that sets state confirms with state_name; every write "
+    "flags description_escaped=true plus a warning when the description was stored as escaped "
+    "markup.\n"
     "description_stripped is plain text and is wrapped into HTML on save; description_html wins "
     "if both are given.\n"
     "To clear a field on update: assignees=[] or labels=[], and start_date=null or "
@@ -477,18 +515,37 @@ def register(mcp: FastMCP) -> None:
                 expand,
             )
 
+        if action == "update" and workitem_identifier:
+            if project_id or workitem_id:
+                return "Error: name the work item by workitem_identifier or by project_id + workitem_id, not both."
+            resolved = resolve_workitem(client, workspace_slug, workitem_identifier)
+            if isinstance(resolved, str):
+                return resolved
+            project_id, workitem_id = resolved
+
         if not project_id:
             return missing(action, "project_id")
 
-        if action == "create":
-            if not name:
+        state_names: dict[str, str] | None = None
+        if action in ("create", "update"):
+            if action == "create" and not name:
                 return missing(action, "name")
+            if action == "update" and not workitem_id:
+                return missing(action, "workitem_id")
+            if state:  # only a state write pays for the lookup
+                state_names = _project_states(client, workspace_slug, project_id)
+                state = _state_id(state, state_names)
+                if state.startswith("Error:"):
+                    return state
+
+        if action == "create":
             return _confirm(
                 client.work_items.create(
                     workspace_slug=workspace_slug,
                     project_id=project_id,
                     data=CreateWorkItem(**write_payload()),
-                )
+                ),
+                state_names,
             )
 
         if not workitem_id:
@@ -513,7 +570,8 @@ def register(mcp: FastMCP) -> None:
                     project_id=project_id,
                     work_item_id=workitem_id,
                     data=UpdateWorkItem(**write_payload()),
-                )
+                ),
+                state_names,
             )
 
         if action == "delete":

@@ -39,3 +39,25 @@ def truncate(text: str, chars: int) -> tuple[str, bool]:
     if chars and chars > 0 and len(text) > chars:
         return text[:chars], True
     return text, False
+
+
+_ESCAPED_TAG = re.compile(r"&lt;/?[A-Za-z][^&]{0,40}?&gt;")
+_REAL_TAG = re.compile(r"</?[A-Za-z][^>]*>")
+
+
+def looks_escaped(stored: str | None) -> bool:
+    """True when rich text was stored as escaped markup (`&lt;p&gt;` shown as literal text).
+
+    The most common silent write failure: the caller sends HTML already escaped, Plane
+    stores it verbatim, and the ticket shows literal tags while the write reports success.
+    It also happens one level down, when markup is sent as plain text and wrapped:
+    `<p>&lt;p&gt;x&lt;/p&gt;</p>`. So the test is "at least as many escaped tags as real
+    ones", which catches both and leaves alone a real body that merely mentions `&lt;br&gt;`.
+    """
+    escaped = len(_ESCAPED_TAG.findall(stored or ""))
+    return escaped > 0 and escaped >= len(_REAL_TAG.findall(stored or ""))
+
+
+ESCAPED_WARNING = (
+    "{field} was stored as escaped markup (literal &lt;p&gt; text, no real tags). Resend it as real HTML, not escaped."
+)
