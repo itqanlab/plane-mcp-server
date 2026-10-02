@@ -24,6 +24,7 @@ from plane.models.work_items import (
     DependencyTypeEnum,
 )
 
+from plane_mcp import session
 from plane_mcp.client import get_plane_client_context
 from plane_mcp.toolkit import (
     Action,
@@ -170,16 +171,97 @@ REMOVE_UNSUPPORTED = (
     "Error: this Plane deployment cannot remove relations through its API. It has no "
     "dependency or custom-relation endpoints, and the legacy relations endpoint only lists "
     "and creates (checked against Plane 1.4.2; removal exists only in the web app, behind a "
-    "browser session). Nothing was changed. Remove the relation in the Plane web UI."
+    "browser session). Nothing was changed. Remove the relation in the Plane web UI, or set "
+    f"{session.EMAIL_ENV} and {session.PASSWORD_ENV} for a Plane user who is a member of the "
+    "project so this server can remove it through a web session."
 )
+
+HTTP_FORBIDDEN = 403
+
+
+def _relation_kind(legacy: dict | None, related_work_item_id: str) -> str | None:
+    """The relation kind linking to `related_work_item_id` in a legacy read, or None."""
+    for kind, entries in ((legacy or {}).get("dependencies") or {}).items():
+        if related_work_item_id in _related_ids(entries):
+            return kind
+    return None
+
+
+def _identifier(client, workspace_slug, project_id, work_item_id) -> str:
+    """PROJ-12 for a work item, falling back to its id when either lookup fails."""
+    try:
+        item = client.work_items.retrieve(
+            workspace_slug=workspace_slug, project_id=project_id, work_item_id=work_item_id
+        )
+        project = client.projects.retrieve(workspace_slug=workspace_slug, project_id=project_id)
+        return f"{project.identifier}-{item.sequence_id}"
+    except Exception:  # noqa: BLE001 - a label only; never fail the removal over it
+        return work_item_id
+
+
+def _project_label(client, workspace_slug, project_id) -> str:
+    try:
+        project = client.projects.retrieve(workspace_slug=workspace_slug, project_id=project_id)
+        return f"{project.name} ({project.identifier})"
+    except Exception:  # noqa: BLE001 - a label only
+        return project_id
+
+
+def _session_remove(client, workspace_slug, project_id, work_item_id, related_work_item_id, before):
+    """Remove a relation through the web app's session-only route, then read back.
+
+    The server's `remove_relation` view takes `.first()` and deletes it without a None
+    check, so asking it to remove a relation that does not exist is a 500. Refuse that case
+    here from the legacy read instead.
+    """
+    kind = _relation_kind(before, related_work_item_id)
+    if kind is None:
+        return (
+            f"Error: work item {work_item_id} has no relation to {related_work_item_id}. "
+            "Nothing was changed. List the item's relations to see what it is linked to."
+        )
+
+    path = f"api/workspaces/{workspace_slug}/projects/{project_id}/issues/{work_item_id}/remove-relation/"
+    try:
+        response = session.get_session().post(path, {"related_issue": related_work_item_id})
+    except session.SessionSignInError as exc:
+        return f"Error: {exc} Nothing was changed."
+
+    if response.status_code == HTTP_FORBIDDEN:
+        return (
+            f"Error: the session user {session.get_session().email} is not allowed to edit project "
+            f"{_project_label(client, workspace_slug, project_id)}. Nothing was changed. Add it to the "
+            "project (re-run the plane-bot membership line in reference_plane_selfhosted_limits.md)."
+        )
+    if not 200 <= response.status_code < 300:
+        raise HttpError(status_code=response.status_code, message=f"remove-relation failed: {response.text[:200]}")
+
+    after = _legacy_relations(client, workspace_slug, project_id, work_item_id)
+    return {
+        "workitem": _identifier(client, workspace_slug, project_id, work_item_id),
+        "related_workitem": _related_label(client, workspace_slug, before, kind, related_work_item_id),
+        "relation_type": kind,
+        "removed": _relation_kind(after, related_work_item_id) is None,
+        "source": "web_session_remove_relation",
+    }
+
+
+def _related_label(client, workspace_slug, legacy, kind, related_work_item_id) -> str:
+    """Identifier for the related item, which may sit in another project."""
+    for entry in (legacy.get("dependencies") or {}).get(kind) or []:
+        if isinstance(entry, dict) and str(entry.get("issue_id") or entry.get("id")) == related_work_item_id:
+            if entry.get("project_id"):
+                return _identifier(client, workspace_slug, str(entry["project_id"]), related_work_item_id)
+    return related_work_item_id
 
 
 def _remove_relation(client, workspace_slug, project_id, work_item_id, related_work_item_id, is_dependency):
-    """Remove one relation, or say plainly that this deployment cannot.
+    """Remove one relation, through a web session if the API cannot, or say plainly why not.
 
     On deployments without the dependency endpoints (e.g. Plane Community) both remove
     calls 404, and a bare 404 reads like "relation not found". It is not: the relation is
-    there, the API just has no way to delete it. Report that instead.
+    there, the API just has no way to delete it. With session credentials configured, remove
+    it through the web app's route instead; without them, report that.
     """
     remove = client.work_items.dependencies.remove if is_dependency else client.work_items.custom_relations.remove
     try:
@@ -192,9 +274,12 @@ def _remove_relation(client, workspace_slug, project_id, work_item_id, related_w
     except HttpError as exc:
         if exc.status_code != HTTP_NOT_FOUND:
             raise
-        if _legacy_relations(client, workspace_slug, project_id, work_item_id) is None:
+        before = _legacy_relations(client, workspace_slug, project_id, work_item_id)
+        if before is None:
             raise
-        return REMOVE_UNSUPPORTED
+        if not session.session_configured():
+            return REMOVE_UNSUPPORTED
+        return _session_remove(client, workspace_slug, project_id, work_item_id, related_work_item_id, before)
     return None
 
 

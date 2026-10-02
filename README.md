@@ -145,6 +145,14 @@ unchanged.
 | `PLANE_API_KEY` | stdio | API key |
 | `PLANE_WORKSPACE_SLUG` | stdio | Target workspace |
 | `PLANE_BASE_URL` | optional | Plane API URL (default `https://api.plane.so`) |
+| `PLANE_SESSION_EMAIL` | optional | Plane user that signs in to the web app for session-only operations |
+| `PLANE_SESSION_PASSWORD` | optional | That user's password |
+
+Some operations exist only in Plane's web app, behind a browser session that an API key cannot
+open. Today that is relation removal on Plane Community (`workitem_relation delete`). With the two
+`PLANE_SESSION_*` variables set, the server signs in as that user and removes the relation through
+the web app's own route; without them, it says removal is unsupported. Use a dedicated user that is
+a member of every project it should edit.
 
 The remote transports carry credentials in the connection — the OAuth flow or the
 PAT headers — and need none of these.
