@@ -21,17 +21,23 @@ from plane_mcp.toolkit import (
     render_mentions,
     tokenize_mentions,
 )
+from plane_mcp.toolkit.identifiers import resolve_workitem
+from plane_mcp.toolkit.text import ESCAPED_WARNING, looks_escaped
 
 NAME = "workitem_comment"
 TITLE = "Work item comments"
 
+ITEM = ("project_id", "workitem_id", "workitem_identifier")
+BY_ITEM = "name the work item by project_id + workitem_id or by workitem_identifier (PROJ-N), not both"
+
 ACTIONS = (
-    Action("list", ("project_id", "workitem_id"), ("cursor", "per_page"), read=True),
+    Action("list", optional=(*ITEM, "cursor", "per_page"), note=BY_ITEM, read=True),
     Action("retrieve", ("project_id", "workitem_id", "comment_id"), read=True),
     Action(
         "create",
-        ("project_id", "workitem_id", "comment_html"),
-        ("access", "external_source", "external_id"),
+        ("comment_html",),
+        (*ITEM, "access", "external_source", "external_id"),
+        note=BY_ITEM,
     ),
     Action(
         "update",
@@ -43,6 +49,9 @@ ACTIONS = (
 
 FOOTER = (
     "comment_html is HTML, e.g. '<p>Looks good.</p>'. access is INTERNAL or EXTERNAL.\n"
+    "create and update return a short confirmation (id, workitem, created_at, comment_chars, "
+    "comment_escaped) instead of echoing the comment; comment_escaped=true comes with a warning "
+    "that the HTML was stored as literal text. retrieve and list return the comment itself.\n"
     f"To mention someone, write {MENTION_TOKEN} inline -- '<p>{MENTION_TOKEN} can you review?</p>' -- "
     "and the chip and the notification are generated for you. A bare @name is ordinary text "
     "that notifies nobody. The id must belong to a member of the work item's project; "
@@ -56,6 +65,21 @@ LEGACY = {
     "update_work_item_comment": "update",
     "delete_work_item_comment": "delete",
 }
+
+
+def _confirm(comment: Any, workitem: str) -> dict[str, Any]:
+    """What a comment write needs to confirm, without sending the comment back."""
+    stored = getattr(comment, "comment_html", None) or ""
+    out = {
+        "id": getattr(comment, "id", None),
+        "workitem": workitem,
+        "created_at": getattr(comment, "created_at", None),
+        "comment_chars": len(stored),
+        "comment_escaped": looks_escaped(stored),
+    }
+    if out["comment_escaped"]:
+        out["warning"] = ESCAPED_WARNING.format(field="comment_html")
+    return out
 
 
 def _legible(comment: Any) -> Any:
@@ -75,6 +99,7 @@ def register(mcp: FastMCP) -> None:
         action: Literal["list", "retrieve", "create", "update", "delete"],
         project_id: str = "",
         workitem_id: str = "",
+        workitem_identifier: str = "",
         comment_id: str = "",
         comment_html: str = "",
         access: str = "",
@@ -82,11 +107,21 @@ def register(mcp: FastMCP) -> None:
         external_id: str = "",
         cursor: str = "",
         per_page: int = 0,
-    ) -> WorkItemComment | list[WorkItemComment] | str | None:
+    ) -> WorkItemComment | list[WorkItemComment] | dict[str, Any] | str | None:
         client, workspace_slug = get_plane_client_context()
 
+        if action == "create" and not comment_html:
+            return missing(action, "comment_html")
+        if workitem_identifier:
+            if project_id or workitem_id:
+                return "Error: name the work item by workitem_identifier or by project_id + workitem_id, not both."
+            resolved = resolve_workitem(client, workspace_slug, workitem_identifier)
+            if isinstance(resolved, str):
+                return resolved
+            project_id, workitem_id = resolved
         if error := needs(action, project_id=project_id, workitem_id=workitem_id):
             return error
+        workitem = workitem_identifier.strip().upper() or workitem_id
 
         if action == "list":
             page = client.work_items.comments.list(
@@ -100,11 +135,9 @@ def register(mcp: FastMCP) -> None:
             return page
 
         if action == "create":
-            if not comment_html:
-                return missing(action, "comment_html")
             if error := project_mention_error(client, workspace_slug, project_id, comment_html):
                 return error
-            return _legible(
+            return _confirm(
                 client.work_items.comments.create(
                     workspace_slug=workspace_slug,
                     project_id=project_id,
@@ -115,7 +148,8 @@ def register(mcp: FastMCP) -> None:
                         external_source=opt(external_source),
                         external_id=opt(external_id),
                     ),
-                )
+                ),
+                workitem,
             )
 
         if not comment_id:
@@ -134,7 +168,7 @@ def register(mcp: FastMCP) -> None:
         if action == "update":
             if error := project_mention_error(client, workspace_slug, project_id, comment_html):
                 return error
-            return _legible(
+            return _confirm(
                 client.work_items.comments.update(
                     workspace_slug=workspace_slug,
                     project_id=project_id,
@@ -146,7 +180,8 @@ def register(mcp: FastMCP) -> None:
                         external_source=opt(external_source),
                         external_id=opt(external_id),
                     ),
-                )
+                ),
+                workitem,
             )
 
         client.work_items.comments.delete(

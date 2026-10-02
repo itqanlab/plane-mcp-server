@@ -225,18 +225,12 @@ def test_a_comment_with_no_mention_never_asks_who_the_members_are(registered, sp
     assert spy.recorder.methods == ["work_items.comments.create"]
 
 
-@pytest.mark.parametrize(
-    ("action", "arguments", "method"),
-    [
-        ("retrieve", {"comment_id": "c"}, "work_items.comments.retrieve"),
-        ("create", {"comment_html": "<p>hi</p>"}, "work_items.comments.create"),
-    ],
-    ids=["retrieve", "create"],
-)
-def test_a_comment_reads_back_in_the_form_it_is_written(action, arguments, method, registered, spy):
-    spy.returns[method] = WorkItemComment(id="c", comment_html=render_mentions(f"<p>@[{ALICE}]</p>"))
+def test_a_comment_reads_back_in_the_form_it_is_written(registered, spy):
+    spy.returns["work_items.comments.retrieve"] = WorkItemComment(
+        id="c", comment_html=render_mentions(f"<p>@[{ALICE}]</p>")
+    )
 
-    result = registered["workitem_comment"].fn(action=action, project_id=PROJECT, workitem_id="w", **arguments)
+    result = registered["workitem_comment"].fn(action="retrieve", project_id=PROJECT, workitem_id="w", comment_id="c")
 
     assert result.comment_html == f"<p>@[{ALICE}]</p>"
 
