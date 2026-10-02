@@ -27,18 +27,28 @@ Deliberately small, covering the filters that matter for scheduling work:
 
     field = "value"        field != "value"
     field IN ("a", "b")    field NOT IN ("a", "b")
+    date < "2026-09-18"    date <= / > / >= "2026-09-18T12:00:00Z"
     ... AND ...
 
 Fields: ``state``, ``priority``, ``type_id``, ``parent``, ``project``, ``sequence_id``,
-``is_draft``. Anything else, and any ``OR``/function call, is treated as unevaluable —
-which downgrades to the honest "unverified" path rather than a wrong answer.
+``is_draft``, and the dates ``updated_at`` and ``created_at``. Anything else, and any
+``OR``/function call, is treated as unevaluable — which downgrades to the honest
+"unverified" path rather than a wrong answer.
 """
 
 from __future__ import annotations
 
+import operator
 import re
+from datetime import date, datetime, timezone
 from typing import Any
 
+# Fields the client-side filter can evaluate. The equality operators (=, !=, IN, NOT IN)
+# apply to every field except the dates. The dates take <, <=, > and >= against an ISO date
+# or datetime string; a date with no time means midnight UTC. That is what makes "open
+# tickets untouched for 14 days" one call:
+#     state NOT IN ("Done", "Cancelled") AND updated_at < "<today minus 14 days>"
+DATE_FIELDS = {"updated_at", "created_at"}
 EVALUABLE_FIELDS = {
     "state",
     "priority",
@@ -47,12 +57,15 @@ EVALUABLE_FIELDS = {
     "project",
     "sequence_id",
     "is_draft",
+    *DATE_FIELDS,
 }
+_COMPARE = {"<=": operator.le, ">=": operator.ge, "<": operator.lt, ">": operator.gt}
+COMPARISONS = tuple(_COMPARE)
 
 _CLAUSE = re.compile(
     r"""^\s*
     (?P<field>[A-Za-z_][A-Za-z0-9_]*)\s*
-    (?P<op>!=|=|\bNOT\s+IN\b|\bIN\b)\s*
+    (?P<op><=|>=|<|>|!=|=|\bNOT\s+IN\b|\bIN\b)\s*
     (?P<value>\(.*?\)|"[^"]*"|'[^']*'|[^\s()]+)
     \s*$""",
     re.IGNORECASE | re.VERBOSE | re.DOTALL,
@@ -78,6 +91,24 @@ def _values(raw: str) -> list[str]:
     return [_unquote(raw)]
 
 
+def as_datetime(value: Any) -> datetime | None:
+    """An ISO date or datetime (string or object) as an aware UTC datetime, else None."""
+    if isinstance(value, datetime):
+        moment = value
+    elif isinstance(value, date):
+        moment = datetime(value.year, value.month, value.day)
+    elif isinstance(value, str) and value.strip():
+        text = value.strip()
+        text = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
+        try:
+            moment = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    else:
+        return None
+    return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+
+
 def parse(pql: str) -> list[tuple[str, str, list[str]]]:
     """Parse a supported pql into (field, op, values). Raise Unevaluable otherwise."""
     if not pql or not pql.strip():
@@ -98,7 +129,12 @@ def parse(pql: str) -> list[tuple[str, str, list[str]]]:
         if field not in EVALUABLE_FIELDS:
             raise Unevaluable(f"field not evaluable client-side: {field}")
         op = re.sub(r"\s+", " ", m.group("op").strip().upper())
-        clauses.append((field, op, _values(m.group("value"))))
+        values = _values(m.group("value"))
+        if (op in COMPARISONS) != (field in DATE_FIELDS):
+            raise Unevaluable(f"{field} {op} is not evaluated client-side; <, <=, >, >= are for dates only")
+        if op in COMPARISONS and (len(values) != 1 or as_datetime(values[0]) is None):
+            raise Unevaluable(f'{field} {op} needs one ISO date such as "2026-09-18", got {m.group("value")}')
+        clauses.append((field, op, values))
     if not clauses:
         raise Unevaluable("no clauses")
     return clauses
@@ -115,7 +151,11 @@ def matches(row: dict[str, Any], clauses: list[tuple[str, str, list[str]]]) -> b
     for field, op, values in clauses:
         got = _row_value(row, field)
         vals = [str(v) for v in values]
-        if op in ("=", "IN"):
+        if op in COMPARISONS:
+            moment, bound = as_datetime(row.get(field)), as_datetime(values[0])
+            if moment is None or bound is None or not _COMPARE[op](moment, bound):
+                return False
+        elif op in ("=", "IN"):
             if got is None or got not in vals:
                 return False
         elif op in ("!=", "NOT IN"):
@@ -209,21 +249,57 @@ def _resolve_state_names(clauses, state_ids_by_name: dict[str, str]):
     return resolved, unknown
 
 
-def filter_board(list_page, list_states, pql: str, fields: str | None, dump) -> dict[str, Any]:
-    """Every row of a project that matches `pql`, filtered here.
+PRIORITY_RANK = {"urgent": 0, "high": 1, "medium": 2, "low": 3, "none": 4}
+
+
+def _newest_first(row: dict[str, Any]) -> int:
+    return -int(row.get("sequence_id") or 0)
+
+
+def _moment(row: dict[str, Any]) -> float:
+    moment = as_datetime(row.get("updated_at"))
+    return moment.timestamp() if moment else 0.0
+
+
+# Client-side orderings. "priority" is the default: urgent first, then high, medium, low,
+# none, and the newest ticket first within a priority (the order a scheduler picks in).
+ORDERINGS = {
+    "priority": (lambda r: (PRIORITY_RANK.get(r.get("priority") or "none", 5), _newest_first(r)), ("priority",)),
+    "-updated_at": (lambda r: (-_moment(r), _newest_first(r)), ("updated_at",)),
+    "updated_at": (lambda r: (_moment(r), _newest_first(r)), ("updated_at",)),
+    "sequence_id": (lambda r: -_newest_first(r), ()),
+    "-sequence_id": (_newest_first, ()),
+}
+
+
+def filter_board(
+    list_page, list_states, pql: str, fields: str | None, dump, order_by: str | None = None, limit: int = 0
+) -> dict[str, Any]:
+    """Every row of a project that matches `pql`, filtered, sorted and capped here.
 
     `list_page(cursor) -> response` fetches one page (no pql), `list_states() -> [state]`
     lists the project's states and `dump(results, fields)` serialises a page. Kept free of
     the tool module so it can be tested without a server.
+
+    Rows come back in `order_by` order (default "priority", see ORDERINGS). `limit` caps
+    the rows returned after sorting; `matched` is the total before the cap.
     """
+    ordering = ORDERINGS.get(order_by or "priority")
+    if ordering is None:
+        return {
+            "error": f"order_by {order_by!r} is not supported when filtering client-side.",
+            "supported_order_by": list(ORDERINGS),
+        }
+    sort_key, sort_fields = ordering
     try:
         clauses = parse(pql) if pql.strip() else []  # no pql: every row
     except Unevaluable as exc:
         return {
             "error": f"This Plane edition cannot filter server-side, and this pql cannot be "
             f"evaluated client-side ({exc}).",
-            "supported_here": 'field = "v", field != "v", field IN ("a","b"), NOT IN, joined by AND. '
-            "Fields: " + ", ".join(sorted(EVALUABLE_FIELDS)) + '. state accepts a name, e.g. state = "Todo".',
+            "supported_here": 'field = "v", field != "v", field IN ("a","b"), NOT IN, joined by AND; '
+            'dates take <, <=, >, >= "2026-09-18". Fields: ' + ", ".join(sorted(EVALUABLE_FIELDS)) + ". "
+            'state accepts a name, e.g. state = "Todo".',
         }
     if any(field == "state" for field, _, _ in clauses):
         names = {str(s.name).lower(): str(s.id) for s in list_states()}
@@ -233,7 +309,8 @@ def filter_board(list_page, list_states, pql: str, fields: str | None, dump) -> 
 
     wanted = None
     if fields:
-        wanted = ",".join(sorted({*fields.split(","), *(f for f, _, _ in clauses)}))
+        needed = {*(f for f, _, _ in clauses), "sequence_id", *sort_fields}
+        wanted = ",".join(sorted({*fields.split(","), *needed}))
     rows: list[dict[str, Any]] = []
     cursor = None
     for _ in range(MAX_PAGES):
@@ -245,13 +322,15 @@ def filter_board(list_page, list_states, pql: str, fields: str | None, dump) -> 
     else:
         return {"error": f"project has more than {MAX_PAGES * 100} work items; narrow the request"}
 
-    matched = [r for r in rows if matches(r, clauses)]
+    matched = sorted((r for r in rows if matches(r, clauses)), key=sort_key)
+    returned = matched[:limit] if limit and limit > 0 else matched
     if fields:
         keep = {f.strip() for f in fields.split(",")}
-        matched = [{k: v for k, v in r.items() if k in keep} for r in matched]
+        returned = [{k: v for k, v in r.items() if k in keep} for r in returned]
     return {
-        "results": matched,
-        "count": len(matched),
+        "results": returned,
+        "count": len(returned),
+        "matched": len(matched),
         "total_count": len(matched),
         "next_cursor": None,
         "next_page_results": False,
