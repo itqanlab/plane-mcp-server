@@ -53,6 +53,8 @@ CONDITIONAL: dict[tuple[str, str], dict[str, object]] = {
     ("workitem", "manage_assignee"): {"add_user_id": "id-1"},
     ("workitem", "manage_label"): {"add_label_id": "id-1"},
     ("workitem", "count"): {"pql": "state__group = 'started'"},
+    # Named by project_id + workitem_id or by workitem_identifier; neither is required alone.
+    ("workitem", "update"): {"project_id": "p", "workitem_id": "w"},
     ("intake", "update"): {"status": 1},
     ("workitem_relation", "create"): {"relation_type": "blocked_by"},
     ("workitem_property", "manage_type_properties"): {"attach_ids": "id-1"},
