@@ -158,9 +158,23 @@ def _confirm(item: Any) -> dict[str, Any]:
     return out
 
 
+def _sparse(item: Any, fields: str, expand: str = "") -> Any:
+    """A retrieve with `fields` returns those keys and no others.
+
+    Plane honours the sparse fieldset, but the SDK model then fills every key it was not sent
+    with null, so one requested field came back with ~30 empty ones. Dump only what was asked
+    for (and what was expanded), keeping a requested key even when its value is null.
+    """
+    if not fields or fields == "all" or not hasattr(item, "model_dump"):
+        return item
+    requested = {name.strip() for name in f"{fields},{expand}".split(",")} - {""}
+    return item.model_dump(include=requested)
+
+
 FOOTER = (
     "list returns compact rows (" + COMPACT_ROW + ") unless fields is given; fields=all returns "
-    "every field. create and update return a short confirmation; retrieve for the full item.\n"
+    "every field. create and update return a short confirmation; retrieve for the full item. "
+    "retrieve with fields returns only the requested keys.\n"
     f"priority: {', '.join(PRIORITIES)}.\n"
     "UUID fields (assignees, labels, state, parent, type_id) need UUIDs -- list the relevant "
     "resource first if you only have a name.\n"
@@ -403,11 +417,15 @@ def register(mcp: FastMCP) -> None:
                     f"Error: invalid work item identifier {workitem_identifier!r}. "
                     "Expected PROJECT-N, for example ENG-42."
                 )
-            return client.work_items.retrieve_by_identifier(
-                workspace_slug=workspace_slug,
-                project_identifier=head,
-                issue_identifier=int(sequence),
-                params=retrieve_params(),
+            return _sparse(
+                client.work_items.retrieve_by_identifier(
+                    workspace_slug=workspace_slug,
+                    project_identifier=head,
+                    issue_identifier=int(sequence),
+                    params=retrieve_params(),
+                ),
+                fields,
+                expand,
             )
 
         if not project_id:
@@ -428,11 +446,15 @@ def register(mcp: FastMCP) -> None:
             return missing(action, "workitem_id")
 
         if action == "retrieve":
-            return client.work_items.retrieve(
-                workspace_slug=workspace_slug,
-                project_id=project_id,
-                work_item_id=workitem_id,
-                params=retrieve_params(),
+            return _sparse(
+                client.work_items.retrieve(
+                    workspace_slug=workspace_slug,
+                    project_id=project_id,
+                    work_item_id=workitem_id,
+                    params=retrieve_params(),
+                ),
+                fields,
+                expand,
             )
 
         if action == "update":
