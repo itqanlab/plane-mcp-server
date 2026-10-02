@@ -20,6 +20,7 @@ from plane.models.work_item_relation_definitions import (
 from plane.models.work_items import (
     CreateWorkItemCustomRelation,
     CreateWorkItemDependency,
+    CreateWorkItemRelation,
     DependencyTypeEnum,
 )
 
@@ -197,6 +198,70 @@ def _remove_relation(client, workspace_slug, project_id, work_item_id, related_w
     return None
 
 
+CUSTOM_UNAVAILABLE = (
+    "Error: this Plane deployment has no custom-relation endpoint, so custom relations are not "
+    "available here. Nothing was changed. Use a built-in relation_type instead."
+)
+
+HTTP_BAD_REQUEST = 400
+
+
+def _related_ids(entries) -> list[str]:
+    """Pull work item ids out of legacy relation entries, which are dicts (or bare ids)."""
+    ids = []
+    for entry in entries:
+        if isinstance(entry, dict):
+            ids.append(str(entry.get("issue_id") or entry.get("id") or ""))
+        else:
+            ids.append(str(entry))
+    return [i for i in ids if i]
+
+
+def _legacy_create(client, workspace_slug, project_id, work_item_id, relation_type, targets):
+    """Create relations through the legacy endpoint, then read them back.
+
+    Used when `dependencies.create` 404s (e.g. Plane Community 1.4.2). The legacy endpoint
+    takes `{"relation_type": ..., "issues": [...]}` and accepts every kind in
+    LEGACY_RELATION_KINDS. `relations.create` returns raw JSON without a response model, so
+    the SDK call is safe here; the read-back goes through `_legacy_relations`, which skips the
+    broken list model.
+
+    Returns None when the legacy endpoint is missing too, so the caller re-raises the
+    original 404.
+    """
+    if _legacy_relations(client, workspace_slug, project_id, work_item_id) is None:
+        return None
+    if relation_type not in LEGACY_RELATION_KINDS:
+        return (
+            f"Error: relation_type {relation_type!r} is not supported by this deployment's relations "
+            f"endpoint. Supported: {', '.join(LEGACY_RELATION_KINDS)}. Nothing was changed."
+        )
+    try:
+        client.work_items.relations.create(
+            workspace_slug=workspace_slug,
+            project_id=project_id,
+            work_item_id=work_item_id,
+            data=CreateWorkItemRelation(relation_type=relation_type, issues=targets),  # type: ignore[arg-type]
+        )
+    except HttpError as exc:
+        if exc.status_code != HTTP_BAD_REQUEST:
+            raise
+        return f"Error: Plane refused the {relation_type} relation: {exc}. Nothing was changed."
+
+    after = _legacy_relations(client, workspace_slug, project_id, work_item_id) or {}
+    present = set(_related_ids((after.get("dependencies") or {}).get(relation_type) or []))
+    result = {
+        "workitem_id": work_item_id,
+        "relation_type": relation_type,
+        "related_workitem_ids": [t for t in targets if t in present],
+        "source": "legacy_relations_endpoint",
+    }
+    not_confirmed = [t for t in targets if t not in present]
+    if not_confirmed:
+        result["not_confirmed"] = not_confirmed
+    return result
+
+
 def register(mcp: FastMCP) -> None:
     @mcp.tool(
         name=NAME,
@@ -307,26 +372,43 @@ def register(mcp: FastMCP) -> None:
             if relation_type:
                 if error := one_of("relation_type", relation_type, DEPENDENCY_TYPES, _OTHER_RELATIONS):
                     return error
-                return client.work_items.dependencies.create(
-                    workspace_slug=workspace_slug,
-                    project_id=project_id,
-                    work_item_id=workitem_id,
-                    data=CreateWorkItemDependency(
-                        relation_type=relation_type,  # type: ignore[arg-type]
-                        work_item_ids=targets,
-                    ),
-                )
+                try:
+                    return client.work_items.dependencies.create(
+                        workspace_slug=workspace_slug,
+                        project_id=project_id,
+                        work_item_id=workitem_id,
+                        data=CreateWorkItemDependency(
+                            relation_type=relation_type,  # type: ignore[arg-type]
+                            work_item_ids=targets,
+                        ),
+                    )
+                except HttpError as exc:
+                    if exc.status_code != HTTP_NOT_FOUND:
+                        raise
+                    # No dependency endpoint (e.g. Plane Community): create through the legacy
+                    # relations endpoint instead, the same fallback `list` uses.
+                    created = _legacy_create(client, workspace_slug, project_id, workitem_id, relation_type, targets)
+                    if created is None:
+                        raise
+                    return created
             if relation_definition_id and relation_definition_label:
-                return client.work_items.custom_relations.create(
-                    workspace_slug=workspace_slug,
-                    project_id=project_id,
-                    work_item_id=workitem_id,
-                    data=CreateWorkItemCustomRelation(
-                        relation_definition_id=relation_definition_id,
-                        relation_definition_type=relation_definition_label,
-                        work_item_ids=targets,
-                    ),
-                )
+                try:
+                    return client.work_items.custom_relations.create(
+                        workspace_slug=workspace_slug,
+                        project_id=project_id,
+                        work_item_id=workitem_id,
+                        data=CreateWorkItemCustomRelation(
+                            relation_definition_id=relation_definition_id,
+                            relation_definition_type=relation_definition_label,
+                            work_item_ids=targets,
+                        ),
+                    )
+                except HttpError as exc:
+                    if exc.status_code != HTTP_NOT_FOUND:
+                        raise
+                    if _legacy_relations(client, workspace_slug, project_id, workitem_id) is None:
+                        raise
+                    return CUSTOM_UNAVAILABLE
             return (
                 "Error: provide relation_type for a built-in dependency, or both "
                 "relation_definition_id and relation_definition_label for a custom relation. "
