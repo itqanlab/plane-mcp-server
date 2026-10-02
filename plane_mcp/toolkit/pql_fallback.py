@@ -27,18 +27,28 @@ Deliberately small, covering the filters that matter for scheduling work:
 
     field = "value"        field != "value"
     field IN ("a", "b")    field NOT IN ("a", "b")
+    date < "2026-09-18"    date <= / > / >= "2026-09-18T12:00:00Z"
     ... AND ...
 
 Fields: ``state``, ``priority``, ``type_id``, ``parent``, ``project``, ``sequence_id``,
-``is_draft``. Anything else, and any ``OR``/function call, is treated as unevaluable —
-which downgrades to the honest "unverified" path rather than a wrong answer.
+``is_draft``, and the dates ``updated_at`` and ``created_at``. Anything else, and any
+``OR``/function call, is treated as unevaluable — which downgrades to the honest
+"unverified" path rather than a wrong answer.
 """
 
 from __future__ import annotations
 
+import operator
 import re
+from datetime import date, datetime, timezone
 from typing import Any
 
+# Fields the client-side filter can evaluate. The equality operators (=, !=, IN, NOT IN)
+# apply to every field except the dates. The dates take <, <=, > and >= against an ISO date
+# or datetime string; a date with no time means midnight UTC. That is what makes "open
+# tickets untouched for 14 days" one call:
+#     state NOT IN ("Done", "Cancelled") AND updated_at < "<today minus 14 days>"
+DATE_FIELDS = {"updated_at", "created_at"}
 EVALUABLE_FIELDS = {
     "state",
     "priority",
@@ -47,12 +57,15 @@ EVALUABLE_FIELDS = {
     "project",
     "sequence_id",
     "is_draft",
+    *DATE_FIELDS,
 }
+_COMPARE = {"<=": operator.le, ">=": operator.ge, "<": operator.lt, ">": operator.gt}
+COMPARISONS = tuple(_COMPARE)
 
 _CLAUSE = re.compile(
     r"""^\s*
     (?P<field>[A-Za-z_][A-Za-z0-9_]*)\s*
-    (?P<op>!=|=|\bNOT\s+IN\b|\bIN\b)\s*
+    (?P<op><=|>=|<|>|!=|=|\bNOT\s+IN\b|\bIN\b)\s*
     (?P<value>\(.*?\)|"[^"]*"|'[^']*'|[^\s()]+)
     \s*$""",
     re.IGNORECASE | re.VERBOSE | re.DOTALL,
@@ -78,6 +91,24 @@ def _values(raw: str) -> list[str]:
     return [_unquote(raw)]
 
 
+def as_datetime(value: Any) -> datetime | None:
+    """An ISO date or datetime (string or object) as an aware UTC datetime, else None."""
+    if isinstance(value, datetime):
+        moment = value
+    elif isinstance(value, date):
+        moment = datetime(value.year, value.month, value.day)
+    elif isinstance(value, str) and value.strip():
+        text = value.strip()
+        text = text[:-1] + "+00:00" if text.endswith(("Z", "z")) else text
+        try:
+            moment = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    else:
+        return None
+    return moment if moment.tzinfo else moment.replace(tzinfo=timezone.utc)
+
+
 def parse(pql: str) -> list[tuple[str, str, list[str]]]:
     """Parse a supported pql into (field, op, values). Raise Unevaluable otherwise."""
     if not pql or not pql.strip():
@@ -98,7 +129,12 @@ def parse(pql: str) -> list[tuple[str, str, list[str]]]:
         if field not in EVALUABLE_FIELDS:
             raise Unevaluable(f"field not evaluable client-side: {field}")
         op = re.sub(r"\s+", " ", m.group("op").strip().upper())
-        clauses.append((field, op, _values(m.group("value"))))
+        values = _values(m.group("value"))
+        if (op in COMPARISONS) != (field in DATE_FIELDS):
+            raise Unevaluable(f"{field} {op} is not evaluated client-side; <, <=, >, >= are for dates only")
+        if op in COMPARISONS and (len(values) != 1 or as_datetime(values[0]) is None):
+            raise Unevaluable(f'{field} {op} needs one ISO date such as "2026-09-18", got {m.group("value")}')
+        clauses.append((field, op, values))
     if not clauses:
         raise Unevaluable("no clauses")
     return clauses
@@ -115,7 +151,11 @@ def matches(row: dict[str, Any], clauses: list[tuple[str, str, list[str]]]) -> b
     for field, op, values in clauses:
         got = _row_value(row, field)
         vals = [str(v) for v in values]
-        if op in ("=", "IN"):
+        if op in COMPARISONS:
+            moment, bound = as_datetime(row.get(field)), as_datetime(values[0])
+            if moment is None or bound is None or not _COMPARE[op](moment, bound):
+                return False
+        elif op in ("=", "IN"):
             if got is None or got not in vals:
                 return False
         elif op in ("!=", "NOT IN"):
@@ -222,8 +262,9 @@ def filter_board(list_page, list_states, pql: str, fields: str | None, dump) -> 
         return {
             "error": f"This Plane edition cannot filter server-side, and this pql cannot be "
             f"evaluated client-side ({exc}).",
-            "supported_here": 'field = "v", field != "v", field IN ("a","b"), NOT IN, joined by AND. '
-            "Fields: " + ", ".join(sorted(EVALUABLE_FIELDS)) + '. state accepts a name, e.g. state = "Todo".',
+            "supported_here": 'field = "v", field != "v", field IN ("a","b"), NOT IN, joined by AND; '
+            'dates take <, <=, >, >= "2026-09-18". Fields: ' + ", ".join(sorted(EVALUABLE_FIELDS)) + ". "
+            'state accepts a name, e.g. state = "Todo".',
         }
     if any(field == "state" for field, _, _ in clauses):
         names = {str(s.name).lower(): str(s.id) for s in list_states()}
