@@ -184,6 +184,11 @@ FOOTER = (
     "target_date=null. A field you leave out is not changed.\n"
     "fields is a sparse fieldset: use `project`, not project_id, and `description_html`, not "
     "description.\n"
+    "Where this Plane edition refuses pql (Community), list with a project_id filters client-side: "
+    'field = "v", !=, IN, NOT IN joined by AND, and updated_at/created_at with <, <=, >, >= an ISO '
+    "date. Rows then sort by priority (urgent first, newest first within it) and per_page caps them; "
+    "order_by may be priority, -updated_at, updated_at, sequence_id or -sequence_id. Stale tickets: "
+    'pql=\'state NOT IN ("Done","Cancelled") AND updated_at < "<today minus 14 days>"\'.\n'
     f"count group_by and sub_group_by accept: {', '.join(GROUP_BY_VALUES)}. These are grouping "
     "keys only -- they are not PQL filter fields, and filtering on state__group is rejected."
 )
@@ -345,14 +350,14 @@ def register(mcp: FastMCP) -> None:
                         lambda page_cursor: client.work_items.list(
                             workspace_slug=workspace_slug,
                             project_id=project_id,
-                            params=WorkItemQueryParams(
-                                per_page=100, cursor=page_cursor, order_by=opt(order_by), expand=opt(expand)
-                            ),
+                            params=WorkItemQueryParams(per_page=100, cursor=page_cursor, expand=opt(expand)),
                         ),
                         lambda: client.states.list(workspace_slug=workspace_slug, project_id=project_id).results,
                         pql,
                         opt(fields),
                         dump_results,
+                        order_by=opt(order_by),
+                        limit=per_page,
                     )
                 if failure:
                     return failure

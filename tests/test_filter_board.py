@@ -33,7 +33,7 @@ def run(pql, fields=None):
 
 def test_filters_by_state_name_across_every_page():
     out = run('state = "Todo" AND priority = "high"')
-    assert [r["sequence_id"] for r in out["results"]] == [1, 4]  # 2 is Done, 3 is low
+    assert [r["sequence_id"] for r in out["results"]] == [4, 1]  # 2 is Done, 3 is low; newest first
     assert out["scanned"] == 4 and out["pql_applied"] == "client" and out["next_cursor"] is None
 
 
@@ -98,20 +98,50 @@ def seqs(out):
     return [r["sequence_id"] for r in out["results"]]
 
 
+def test_default_order_is_priority_rank_then_newest():
+    assert seqs(board('state = "Todo"')) == [URGENT, HIGH, LOW, YESTERDAY]
+
+
+def test_priority_filter_keeps_high_and_drops_low():
+    out = board('state = "Todo" AND priority IN ("urgent", "high")')
+    assert seqs(out) == [URGENT, HIGH]
+    assert LOW not in seqs(out) and YESTERDAY not in seqs(out)
+
+
+def test_limit_caps_after_sorting_and_reports_the_total():
+    out = board('state = "Todo"', limit=2)
+    assert seqs(out) == [URGENT, HIGH]
+    assert out["count"] == 2 and out["matched"] == 4 and out["scanned"] == 5
+
+
 def test_stale_recipe_excludes_closed_and_recently_touched():
     out = board('state NOT IN ("Done", "Cancelled") AND updated_at < "2026-09-18"')
-    assert sorted(seqs(out)) == [HIGH, LOW]  # urgent and yesterday are fresh; OLD is Done
+    assert seqs(out) == [HIGH, LOW]  # urgent and yesterday are fresh; OLD is Done
 
 
 def test_date_without_time_is_midnight_utc():
-    assert sorted(seqs(board('updated_at >= "2026-10-01"'))) == [URGENT, YESTERDAY]
+    assert seqs(board('updated_at >= "2026-10-01"')) == [URGENT, YESTERDAY]
     assert seqs(board('updated_at > "2026-10-01T09:00:00Z"')) == [YESTERDAY]
-    assert sorted(seqs(board('updated_at <= "2026-10-01T09:00:00Z"'))) == [URGENT, HIGH, LOW, OLD]
+    assert seqs(board('updated_at <= "2026-10-01T09:00:00Z"', order_by="sequence_id")) == [URGENT, HIGH, LOW, OLD]
 
 
 def test_created_at_is_evaluable_and_missing_dates_never_match():
     out = board('created_at < "2030-01-01"')
     assert out["results"] == [] and out["scanned"] == 5
+
+
+def test_sorted_fields_are_fetched_then_trimmed():
+    out = board('state = "Todo"', fields="name", order_by="-updated_at")
+    assert out["results"] == [{}, {}, {}, {}]  # rows dumped as dicts; name absent from the fixture
+    assert seqs(board('state = "Todo"', order_by="-updated_at")) == [YESTERDAY, URGENT, LOW, HIGH]
+    assert seqs(board('state = "Todo"', order_by="updated_at")) == [HIGH, LOW, URGENT, YESTERDAY]
+    assert seqs(board('state = "Todo"', order_by="-sequence_id")) == [YESTERDAY, LOW, HIGH, URGENT]
+
+
+def test_unsupported_order_by_is_an_error_naming_the_supported_ones():
+    out = board('state = "Todo"', order_by="name")
+    assert "'name' is not supported" in out["error"]
+    assert out["supported_order_by"] == ["priority", "-updated_at", "updated_at", "sequence_id", "-sequence_id"]
 
 
 def test_comparisons_are_for_dates_only_and_need_a_real_date():
