@@ -47,7 +47,14 @@ from plane_mcp.toolkit import (
 )
 from plane_mcp.toolkit.identifiers import resolve_workitem, split_identifier
 from plane_mcp.toolkit.paging import dump_results
-from plane_mcp.toolkit.pql_fallback import apply_fallback, count_board, edition_refuses_pql, filter_board
+from plane_mcp.toolkit.pql_fallback import (
+    apply_fallback,
+    clause_columns,
+    count_board,
+    edition_refuses_pql,
+    filter_board,
+    missing_fields,
+)
 from plane_mcp.toolkit.text import DEFAULT_BODY_CHARS, ESCAPED_WARNING, looks_escaped, plain_text, truncate
 from plane_mcp.toolkit.triage import (
     MAX_TICKETS,
@@ -493,6 +500,11 @@ def register(mcp: FastMCP) -> None:
             if action == "list_archived" and not project_id:
                 return missing(action, "project_id")
             fields = "" if fields == "all" else (fields or COMPACT_ROW)
+            # The pql check below reads the clause columns off every row, so ask the server for
+            # them too, then hand back only the columns the caller asked for.
+            asked = fields
+            if pql and fields:
+                fields = ",".join(sorted({*fields.split(","), *clause_columns(pql)}))
             params = WorkItemQueryParams(
                 pql=opt(pql),
                 order_by=opt(order_by),
@@ -537,6 +549,12 @@ def register(mcp: FastMCP) -> None:
                 raise
             page = envelope(response, opt(fields))
             if pql:
+                absent = missing_fields(response.results, clause_columns(pql))
+                if absent:
+                    return {
+                        "error": f"the server did not send {', '.join(absent)} for some work items, so "
+                        "the pql cannot be checked client-side. Refusing to read them as non-matches."
+                    }
                 # Some deployments (Plane Community) do not reject an unsupported `pql` —
                 # they return HTTP 200 with the whole board. Left alone, a dropped filter is
                 # indistinguishable from one that matched everything. Check, and say so.
@@ -547,6 +565,9 @@ def register(mcp: FastMCP) -> None:
                     page["pql_warning"] = outcome["warning"]
                 if outcome["applied"] == "client":
                     page["count"] = len(outcome["rows"])
+                if asked and asked != fields:
+                    keep = {f.strip() for f in asked.split(",")}
+                    page["results"] = [{k: v for k, v in r.items() if k in keep} for r in page["results"]]
             return page
 
         if action == "count":
@@ -564,12 +585,10 @@ def register(mcp: FastMCP) -> None:
                 if project_id and (exc.status_code == 404 or refused):  # noqa: PLR2004
                     # Community has no count endpoint (404) and refuses pql: count here.
                     return count_board(
-                        lambda page_cursor: client.work_items.list(
+                        lambda page_cursor, page_fields: client.work_items.list(
                             workspace_slug=workspace_slug,
                             project_id=project_id,
-                            params=WorkItemQueryParams(
-                                per_page=100, cursor=page_cursor, fields="id,sequence_id,state,priority"
-                            ),
+                            params=WorkItemQueryParams(per_page=100, cursor=page_cursor, fields=page_fields),
                         ),
                         lambda: client.states.list(workspace_slug=workspace_slug, project_id=project_id).results,
                         pql,
