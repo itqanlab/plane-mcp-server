@@ -65,9 +65,11 @@ def test_count_groups_by_state_name_and_group():
     from plane_mcp.toolkit.pql_fallback import count_board
 
     states = [NS(id=TODO, name="Todo", group="unstarted"), NS(id=DONE, name="Done", group="completed")]
-    by_name = count_board(lambda cur: PAGES[cur], lambda: states, "", "state_id", dump_results)
+    by_name = count_board(lambda cur, fields: PAGES[cur], lambda: states, "", "state_id", dump_results)
     assert by_name["total"] == 4 and by_name["groups"] == {"Todo": 3, "Done": 1}
-    high = count_board(lambda cur: PAGES[cur], lambda: states, 'priority = "high"', "state__group", dump_results)
+    high = count_board(
+        lambda cur, fields: PAGES[cur], lambda: states, 'priority = "high"', "state__group", dump_results
+    )
     assert high["total"] == 3 and high["groups"] == {"unstarted": 2, "completed": 1}
 
 
@@ -125,9 +127,10 @@ def test_date_without_time_is_midnight_utc():
     assert seqs(board('updated_at <= "2026-10-01T09:00:00Z"', order_by="sequence_id")) == [URGENT, HIGH, LOW, OLD]
 
 
-def test_created_at_is_evaluable_and_missing_dates_never_match():
+def test_a_clause_field_the_server_did_not_send_is_an_error_not_a_silent_zero():
+    # BOARD rows carry no created_at. This used to come back as zero matches (PMCP-15).
     out = board('created_at < "2030-01-01"')
-    assert out["results"] == [] and out["scanned"] == 5
+    assert "results" not in out and "created_at" in out["error"]
 
 
 def test_sorted_fields_are_fetched_then_trimmed():
@@ -153,5 +156,5 @@ def test_comparisons_are_for_dates_only_and_need_a_real_date():
 def test_count_accepts_the_date_operators():
     from plane_mcp.toolkit.pql_fallback import count_board
 
-    out = count_board(lambda cur: BOARD, lambda: BOARD_STATES, 'updated_at < "2026-09-18"', "", dump_results)
+    out = count_board(lambda cur, fields: BOARD, lambda: BOARD_STATES, 'updated_at < "2026-09-18"', "", dump_results)
     assert out["total"] == 3  # HIGH, LOW, OLD

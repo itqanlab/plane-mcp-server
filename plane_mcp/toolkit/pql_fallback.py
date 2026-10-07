@@ -272,8 +272,33 @@ ORDERINGS = {
 }
 
 
+def _absent(item: Any, field: str) -> bool:
+    """True when the server did not send `field` for this row (as opposed to sending null).
+
+    A pydantic row dumps every declared key, with None for the ones it was never given, so
+    the dump cannot tell "not fetched" from "null". `model_fields_set` can.
+    """
+    if isinstance(item, dict):
+        return field not in item
+    provided = getattr(item, "model_fields_set", None)
+    return provided is not None and field not in provided
+
+
+def missing_fields(items: Any, fields) -> list[str]:
+    """The fields (of `fields`) that some row in `items` never received, sorted."""
+    return sorted({f for item in items or [] for f in fields if _absent(item, f)})
+
+
 def filter_board(
-    list_page, list_states, pql: str, fields: str | None, dump, order_by: str | None = None, limit: int = 0
+    list_page,
+    list_states,
+    pql: str,
+    fields: str | None,
+    dump,
+    order_by: str | None = None,
+    limit: int = 0,
+    fetch_fields: str | None = None,
+    also_require: tuple[str, ...] = (),
 ) -> dict[str, Any]:
     """Every row of a project that matches `pql`, filtered, sorted and capped here.
 
@@ -283,6 +308,10 @@ def filter_board(
 
     Rows come back in `order_by` order (default "priority", see ORDERINGS). `limit` caps
     the rows returned after sorting; `matched` is the total before the cap.
+
+    `fetch_fields`, when set, is passed to `list_page(cursor, fetch_fields)` so the server
+    sends those columns. Whatever the clauses (and `also_require`) read must be present on
+    every row: a clause field the server did not send is an error, never a quiet non-match.
     """
     ordering = ORDERINGS.get(order_by or "priority")
     if ordering is None:
@@ -311,10 +340,18 @@ def filter_board(
     if fields:
         needed = {*(f for f, _, _ in clauses), "sequence_id", *sort_fields}
         wanted = ",".join(sorted({*fields.split(","), *needed}))
+    required = sorted({*(f for f, _, _ in clauses), *also_require})
     rows: list[dict[str, Any]] = []
     cursor = None
     for _ in range(MAX_PAGES):
-        response = list_page(cursor)
+        response = list_page(cursor, fetch_fields) if fetch_fields else list_page(cursor)
+        absent = missing_fields(response.results, required)
+        if absent:
+            return {
+                "error": f"the server did not send {', '.join(absent)} for some work items, so "
+                f"{'that filter' if len(absent) == 1 else 'those filters'} cannot be evaluated. "
+                "Refusing to count them as non-matches."
+            }
         rows.extend(dump(response.results, wanted))
         if not getattr(response, "next_page_results", False) or not response.next_cursor:
             break
@@ -339,14 +376,50 @@ def filter_board(
     }
 
 
+COUNT_BASE_FIELDS = ("id", "sequence_id", "state", "priority")
+
+
+def group_field(group_by: str) -> str:
+    """The row field a `group_by` reads: state_id and state__group both read `state`."""
+    if group_by in ("state_id", "state__group"):
+        return "state"
+    return group_by
+
+
+def clause_columns(pql: str) -> list[str]:
+    """The row columns a pql's clauses read; empty when the pql is not evaluable here."""
+    try:
+        return sorted({f for f, _, _ in parse(pql)}) if pql and pql.strip() else []
+    except Unevaluable:
+        return []  # apply_fallback / filter_board report the unevaluable pql themselves
+
+
+def count_fetch_fields(pql: str, group_by: str) -> list[str]:
+    """Columns a client-side count must ask the server for, derived from its own request."""
+    clause_fields = clause_columns(pql)
+    extra = [group_field(group_by)] if group_by else []
+    return sorted({*COUNT_BASE_FIELDS, *clause_fields, *extra})
+
+
 def count_board(list_page, list_states, pql: str, group_by: str, dump) -> dict[str, Any]:
     """`count` for editions whose count endpoint is absent (Community answers 404).
 
     Counts the rows `filter_board` returns. group_by `state_id` and `state__group` are
     keyed by state name / group rather than uuid, so the answer reads without a lookup.
+    `list_page(cursor, fields)` must ask the server for `fields`: the columns the pql and
+    the grouping read are derived here, not hard-coded by the caller.
     """
     states = list(list_states())
-    page = filter_board(list_page, lambda: states, pql, "sequence_id,state,priority", dump)
+    wanted = ",".join(count_fetch_fields(pql, group_by))
+    page = filter_board(
+        list_page,
+        lambda: states,
+        pql,
+        wanted,
+        dump,
+        fetch_fields=wanted,
+        also_require=(group_field(group_by),) if group_by else (),
+    )
     if "error" in page:
         return page
     out: dict[str, Any] = {"total": page["count"], "counted": "client", "scanned": page["scanned"]}
@@ -359,7 +432,7 @@ def count_board(list_page, list_states, pql: str, group_by: str, dump) -> dict[s
                 return str(state.name) if state else str(row.get("state"))
             if group_by == "state__group":
                 return str(getattr(state, "group", None) or "unknown")
-            return str(row.get(group_by.removesuffix("_id")) or "none")
+            return str(row.get(group_field(group_by)) or "none")
 
         groups: dict[str, int] = {}
         for row in page["results"]:
