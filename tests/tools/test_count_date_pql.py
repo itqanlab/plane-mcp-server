@@ -206,3 +206,46 @@ def test_list_on_an_edition_that_filters_does_not_turn_trimmed_columns_into_a_fa
         assert sorted(r["sequence_id"] for r in outcome["results"]) == AFTER, outcome
     else:
         assert _is_error_naming(outcome, "created_at"), outcome
+
+
+class IgnoresPql(FakeWorkItems):
+    """An older edition: pql is accepted with HTTP 200 but ignored, `fields` is honoured.
+
+    This is the server-filter path of `list` (no refusal), where the client re-checks rows.
+    """
+
+    def list(self, workspace_slug, project_id, params=None):
+        fields = getattr(params, "fields", None)
+        self.list_fields.append(fields)
+        wanted = set(fields.split(",")) if fields else None
+        rows = [
+            {k: v for k, v in row.items() if (wanted is None or k in wanted) and k not in self.withhold}
+            for row in self.board
+        ]
+        return NS(
+            results=rows,
+            next_cursor=None,
+            prev_cursor=None,
+            next_page_results=False,
+            prev_page_results=False,
+            total_count=len(rows),
+            count=len(rows),
+        )
+
+
+def test_list_on_an_edition_that_ignores_pql_drops_old_rows_and_hands_back_only_the_asked_columns(registered, plane):
+    # The caller asks only for sequence_id. The server sends the whole board, so the
+    # client must fetch created_at to check the clause, drop #1 and #2, and then trim
+    # created_at back off the rows it returns.
+    items = plane(IgnoresPql(BOARD))
+    out = _call(registered, action="list", pql='created_at > "2026-10-05"', fields="sequence_id")
+    assert sorted(r["sequence_id"] for r in out["results"]) == AFTER, out
+    assert out["count"] == len(AFTER) and out["pql_applied"] == "client", out
+    assert all(set(r) == {"sequence_id"} for r in out["results"]), out["results"]
+    assert any(f and "created_at" in f.split(",") for f in items.list_fields), items.list_fields
+
+
+def test_list_on_an_edition_that_ignores_pql_errors_when_the_column_still_does_not_come_back(registered, plane):
+    plane(IgnoresPql(BOARD, withhold={"created_at"}))
+    outcome = _outcome(lambda: _call(registered, action="list", pql='created_at > "2026-10-05"', fields="sequence_id"))
+    assert _is_error_naming(outcome, "created_at"), outcome
