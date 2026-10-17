@@ -190,14 +190,24 @@ COMPACT_ROW = "id,sequence_id,name,state,priority,parent,labels,assignees,target
 WRITE_ECHO = ("id", "sequence_id", "name", "state", "priority", "parent", "updated_at")
 
 
-def _confirm(item: Any, state_names: dict[str, str] | None = None) -> dict[str, Any]:
+# Never echoed: the description is reported by size and escaping instead.
+NOT_ECHOED = {"description_html", "description_stripped"}
+
+
+def _confirm(item: Any, state_names: dict[str, str] | None = None, written: Any = ()) -> dict[str, Any]:
     """What a write needs to confirm: the item and the fields that decide what it is now.
 
-    Names the state when the project's states are known, and flags a description that was
-    stored as escaped markup -- the write succeeds either way, so only the read-back can tell.
+    Every field the call wrote comes back as Plane stored it, so the caller can check an
+    assignee or a date without reading the item again. Names the state when the project's
+    states are known, and flags a description that was stored as escaped markup -- the write
+    succeeds either way, so only the read-back can tell.
     """
     data = item.model_dump() if hasattr(item, "model_dump") else dict(item or {})
     out = {field: data.get(field) for field in WRITE_ECHO}
+    for field in written:
+        if field in NOT_ECHOED or field in out or field not in data:
+            continue
+        out[field] = ids_of(data[field]) if field in ("assignees", "labels") else data[field]
     if state_names is not None:
         out["state_name"] = state_names.get(str(data.get("state")))
     out["description_chars"] = len(data.get("description_html") or "")
@@ -241,13 +251,16 @@ def _sparse(item: Any, fields: str, expand: str = "") -> Any:
 
 FOOTER = (
     "list returns compact rows (" + COMPACT_ROW + ") unless fields is given; fields=all returns "
-    "every field. create and update return a short confirmation; retrieve for the full item. "
+    "every field. create, update, manage_assignee and manage_label return a short confirmation; retrieve "
+    "for the full item. "
     "retrieve with fields returns only the requested keys.\n"
     f"priority: {', '.join(PRIORITIES)}.\n"
     "state takes a uuid or a state name (any case) on create and update; the other UUID fields "
     "(assignees, labels, parent, type_id) need UUIDs -- list the relevant resource first if you "
     "only have a name. update also takes workitem_identifier (PROJ-N) in place of project_id + "
-    "workitem_id. A create or update that sets state confirms with state_name; every write "
+    "workitem_id. A write echoes every field it set as Plane stored it (assignees, labels, dates and "
+    "the rest), so there is no need to read the item back; one that sets state also confirms with "
+    "state_name. Every write "
     "flags description_escaped=true plus a warning when the description was stored as escaped "
     "markup.\n"
     "description_stripped is plain text and is wrapped into HTML on save; description_html wins "
@@ -663,13 +676,15 @@ def register(mcp: FastMCP) -> None:
                     return state
 
         if action == "create":
+            payload = write_payload()
             return _confirm(
                 client.work_items.create(
                     workspace_slug=workspace_slug,
                     project_id=project_id,
-                    data=CreateWorkItem(**write_payload()),
+                    data=CreateWorkItem(**payload),
                 ),
                 state_names,
+                payload,
             )
 
         if not workitem_id:
@@ -688,14 +703,16 @@ def register(mcp: FastMCP) -> None:
             )
 
         if action == "update":
+            payload = write_payload()
             return _confirm(
                 client.work_items.update(
                     workspace_slug=workspace_slug,
                     project_id=project_id,
                     work_item_id=workitem_id,
-                    data=UpdateWorkItem(**write_payload()),
+                    data=UpdateWorkItem(**payload),
                 ),
                 state_names,
+                payload,
             )
 
         if action == "delete":
@@ -723,9 +740,12 @@ def register(mcp: FastMCP) -> None:
         )
         ids = [value for value in ids_of(getattr(current, field)) if value not in removing]
         ids += [value for value in adding if value not in ids]
-        return client.work_items.update(
-            workspace_slug=workspace_slug,
-            project_id=project_id,
-            work_item_id=workitem_id,
-            data=UpdateWorkItem(**{field: ids}),
+        return _confirm(
+            client.work_items.update(
+                workspace_slug=workspace_slug,
+                project_id=project_id,
+                work_item_id=workitem_id,
+                data=UpdateWorkItem(**{field: ids}),
+            ),
+            written=(field,),
         )

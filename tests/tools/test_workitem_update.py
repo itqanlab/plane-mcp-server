@@ -105,3 +105,50 @@ def test_escaped_description_is_flagged_with_a_warning(stored, escaped, register
     assert ("warning" in out) is escaped
     assert "state_name" not in out  # no state write, no states lookup
     assert "states.list" not in board.recorder.methods
+
+
+U1 = "33333333-3333-3333-3333-333333333333"
+U2 = "44444444-4444-4444-4444-444444444444"
+
+
+def _stored(**fields):
+    data = _written().model_dump() | fields
+    return NS(model_dump=lambda: data)
+
+
+def test_the_reply_echoes_every_field_the_call_set(registered, board):
+    board.returns["work_items.update"] = _stored(assignees=[NS(id=U1)], target_date="2026-10-21", labels=["l1"])
+
+    out = registered["workitem"].fn(
+        action="update", project_id="p", workitem_id="w", assignees=[U1], target_date="2026-10-21"
+    )
+
+    assert out["assignees"] == [U1] and out["target_date"] == "2026-10-21"
+    assert "labels" not in out  # stored, but this call did not set it
+    assert "description_html" not in out
+
+
+def test_a_state_only_update_echoes_no_other_field(registered, board):
+    board.returns["work_items.update"] = _stored(assignees=[U1], target_date="2026-10-21")
+
+    out = registered["workitem"].fn(action="update", project_id="p", workitem_id="w", state=TODO)
+
+    assert "assignees" not in out and "target_date" not in out
+
+
+def test_clearing_a_date_echoes_the_null(registered, board):
+    board.returns["work_items.update"] = _stored(target_date=None)
+
+    out = registered["workitem"].fn(action="update", project_id="p", workitem_id="w", target_date=None)
+
+    assert "target_date" in out and out["target_date"] is None
+
+
+def test_manage_assignee_confirms_with_the_final_set(registered, board):
+    board.returns["work_items.retrieve"] = NS(assignees=[U1])
+    board.returns["work_items.update"] = _stored(assignees=[U1, U2])
+
+    out = registered["workitem"].fn(action="manage_assignee", project_id="p", workitem_id="w", add_user_id=U2)
+
+    assert out["assignees"] == [U1, U2] and out["sequence_id"] == 5
+    assert "description_html" not in out and "labels" not in out
