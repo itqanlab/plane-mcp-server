@@ -51,7 +51,8 @@ CONDITIONAL: dict[tuple[str, str], dict[str, object]] = {
     ("module", "manage_workitems"): {"add_ids": "id-1"},
     ("milestone", "manage_workitems"): {"add_ids": "id-1"},
     ("initiative", "manage_workitems"): {"add_ids": "id-1"},
-    ("workitem", "manage_assignee"): {"add_user_id": "id-1"},
+    # A non-uuid assignee is resolved as a name against the members, which the spy has none of.
+    ("workitem", "manage_assignee"): {"add_user_id": "11111111-1111-1111-1111-111111111111"},
     ("workitem", "manage_label"): {"add_label_id": "id-1"},
     ("workitem", "count"): {"pql": "state__group = 'started'"},
     # Named by project_id + workitem_id or by workitem_identifier; neither is required alone.
@@ -291,12 +292,16 @@ def test_manage_accepts_several_ids_at_once(field, registered, spy):
 
     spy.returns["work_items.retrieve"] = SimpleNamespace(assignees=["existing"], labels=["existing"])
     key = "add_user_id" if field == "assignee" else "add_label_id"
-    registered["workitem"].fn(**{"action": f"manage_{field}", "project_id": "p", "workitem_id": "w", key: '["a", "b"]'})
+    # uuids, since an assignee that is not one is looked up by name
+    a, b = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    registered["workitem"].fn(
+        **{"action": f"manage_{field}", "project_id": "p", "workitem_id": "w", key: f'["{a}", "{b}"]'}
+    )
 
     update = next(c for c in spy.recorder.calls if c.method == "work_items.update")
     sent = update.kwargs["data"]
     written = sent.assignees if field == "assignee" else sent.labels
-    assert written == ["existing", "a", "b"], written
+    assert written == ["existing", a, b], written
 
 
 # Reported by an eval battery: `archive` answered nothing, so the agent verified with a

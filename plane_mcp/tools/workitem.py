@@ -236,6 +236,38 @@ def _state_id(state: str, state_names: dict[str, str]) -> str:
     return f"Error: unknown state {state!r} on this project. Known states: {', '.join(sorted(state_names.values()))}."
 
 
+def _assignee_ids(client: Any, workspace_slug: str, project_id: str, values: list[str]) -> list[str] | str:
+    """Assignees given by uuid, email or display name (any case, a leading @ ignored), as uuids.
+
+    Only a value that is not a uuid pays for the members call. An unknown or ambiguous value
+    is an error string that lists the members, so the caller can retry without a lookup.
+    """
+    if all(_UUID.match(str(value)) for value in values):
+        return values
+    members = [
+        member
+        for member in client.projects.get_members(workspace_slug=workspace_slug, project_id=project_id)
+        if member.is_active is not False
+    ]
+    ids: list[str] = []
+    for value in values:
+        if _UUID.match(str(value)):
+            ids.append(str(value))
+            continue
+        wanted = str(value).strip().lstrip("@").lower()
+        found = {
+            str(member.id)
+            for member in members
+            if wanted in ((member.email or "").lower(), (member.display_name or "").lower())
+        }
+        if len(found) != 1:
+            known = ", ".join(sorted(f"{member.display_name} <{member.email}>" for member in members))
+            problem = "matches more than one member" if found else "is not a member of this project"
+            return f"Error: assignee {value!r} {problem}. Nothing was written. Members: {known}."
+        ids.extend(found)
+    return ids
+
+
 def _sparse(item: Any, fields: str, expand: str = "") -> Any:
     """A retrieve with `fields` returns those keys and no others.
 
@@ -255,9 +287,11 @@ FOOTER = (
     "for the full item. "
     "retrieve with fields returns only the requested keys.\n"
     f"priority: {', '.join(PRIORITIES)}.\n"
-    "state takes a uuid or a state name (any case) on create and update; the other UUID fields "
-    "(assignees, labels, parent, type_id) need UUIDs -- list the relevant resource first if you "
-    "only have a name. update also takes workitem_identifier (PROJ-N) in place of project_id + "
+    "state takes a uuid or a state name (any case) on create and update. assignees (and "
+    "manage_assignee's add_user_id / remove_user_id) take a uuid, an email or a display name; an "
+    "unknown name is refused with the project's members listed. The other UUID fields (labels, "
+    "parent, type_id) need UUIDs -- list the relevant resource first if you only have a name. "
+    "update also takes workitem_identifier (PROJ-N) in place of project_id + "
     "workitem_id. A write echoes every field it set as Plane stored it (assignees, labels, dates and "
     "the rest), so there is no need to read the item back; one that sets state also confirms with "
     "state_name. Every write "
@@ -674,6 +708,11 @@ def register(mcp: FastMCP) -> None:
                 state = _state_id(state, state_names)
                 if state.startswith("Error:"):
                     return state
+            if assignees:
+                resolved_assignees = _assignee_ids(client, workspace_slug, project_id, coerce_list(assignees) or [])
+                if isinstance(resolved_assignees, str):
+                    return resolved_assignees
+                assignees = resolved_assignees
 
         if action == "create":
             payload = write_payload()
@@ -735,6 +774,14 @@ def register(mcp: FastMCP) -> None:
             return missing(action, f"add_{field[:-1]}_id or remove_{field[:-1]}_id")
         # Either side takes one id or several, so adding three assignees is one call.
         adding, removing = coerce_list(add) or [], coerce_list(remove) or []
+        if field == "assignees":
+            for side in (adding, removing):
+                if not side:
+                    continue
+                resolved_side = _assignee_ids(client, workspace_slug, project_id, side)
+                if isinstance(resolved_side, str):
+                    return resolved_side
+                side[:] = resolved_side
         current = client.work_items.retrieve(
             workspace_slug=workspace_slug, project_id=project_id, work_item_id=workitem_id
         )
