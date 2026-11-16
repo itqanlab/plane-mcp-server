@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Literal, get_args
 
 from fastmcp import FastMCP
+from plane.errors import HttpError
 from plane.models.enums import TimezoneEnum
 from plane.models.projects import (
     CreateProject,
@@ -26,6 +27,32 @@ TITLE = "Projects"
 TIMEZONES = get_args(TimezoneEnum)
 
 DEFAULT_PER_PAGE = 100
+
+# Plane Community does not serve `projects/{id}/features` (404 on 1.4.2, measured 2026-11-16), so
+# neither action worked there and no agent could turn Modules on. The same switches live on the
+# project record itself. plane-sdk has no fallback either; this belongs upstream in the SDK too.
+FEATURE_FIELDS = {
+    "modules": "module_view",
+    "cycles": "cycle_view",
+    "views": "issue_views_view",
+    "pages": "page_view",
+    "intakes": "intake_view",
+}
+# ProjectFeature names that differ from this tool's argument names, for refusals.
+ARGUMENT_NAMES = {"work_item_types": "workitem_types"}
+FALLBACK_NOTE = (
+    "where the edition has no features endpoint (Community) it reads and writes the project's own switches, "
+    "which cover modules, cycles, views, pages and intakes only"
+)
+
+
+def _features_of(project: object) -> ProjectFeature:
+    return ProjectFeature(**{name: getattr(project, field, None) for name, field in FEATURE_FIELDS.items()})
+
+
+def _no_features_endpoint(exc: HttpError) -> bool:
+    return exc.status_code == 404
+
 
 ACTIONS = (
     Action(
@@ -77,7 +104,7 @@ ACTIONS = (
     Action("archive", ("project_id",)),
     Action("unarchive", ("project_id",)),
     Action("worklog_summary", ("project_id",), read=True),
-    Action("get_features", ("project_id",), read=True),
+    Action("get_features", ("project_id",), note=FALLBACK_NOTE, read=True),
     Action(
         "update_features",
         ("project_id",),
@@ -93,7 +120,7 @@ ACTIONS = (
             "project_updates",
             "workflows",
         ),
-        note="toggles project features on or off",
+        note=f"toggles project features on or off; {FALLBACK_NOTE}",
     ),
 )
 
@@ -280,21 +307,42 @@ def register(mcp: FastMCP) -> None:
             return client.projects.get_worklog_summary(workspace_slug=workspace_slug, project_id=project_id)
 
         if action == "get_features":
-            return client.projects.get_features(workspace_slug=workspace_slug, project_id=project_id)
+            try:
+                return client.projects.get_features(workspace_slug=workspace_slug, project_id=project_id)
+            except HttpError as exc:
+                if not _no_features_endpoint(exc):
+                    raise
+            return _features_of(client.projects.retrieve(workspace_slug=workspace_slug, project_id=project_id))
 
-        return client.projects.update_features(
+        wanted = ProjectFeature(
+            modules=modules,
+            cycles=cycles,
+            views=views,
+            pages=pages,
+            intakes=intakes,
+            work_item_types=workitem_types,
+            epics=epics,
+            parallel_cycles=parallel_cycles,
+            project_updates=project_updates,
+            workflows=workflows,
+        )
+        try:
+            return client.projects.update_features(workspace_slug=workspace_slug, project_id=project_id, data=wanted)
+        except HttpError as exc:
+            if not _no_features_endpoint(exc):
+                raise
+        toggles = wanted.model_dump(exclude_none=True)
+        if not toggles:
+            return "Error: update_features needs at least one toggle."
+        if unsupported := [ARGUMENT_NAMES.get(name, name) for name in toggles if name not in FEATURE_FIELDS]:
+            return (
+                "Error: this Plane edition has no features endpoint, and "
+                f"{', '.join(unsupported)} {'has' if len(unsupported) == 1 else 'have'} no switch on the project "
+                "itself, so nothing was changed. Only modules, cycles, views, pages and intakes can be toggled here."
+            )
+        project = client.projects.update(
             workspace_slug=workspace_slug,
             project_id=project_id,
-            data=ProjectFeature(
-                modules=modules,
-                cycles=cycles,
-                views=views,
-                pages=pages,
-                intakes=intakes,
-                work_item_types=workitem_types,
-                epics=epics,
-                parallel_cycles=parallel_cycles,
-                project_updates=project_updates,
-                workflows=workflows,
-            ),
+            data=UpdateProject(**{FEATURE_FIELDS[name]: value for name, value in toggles.items()}),
         )
+        return _features_of(project)
