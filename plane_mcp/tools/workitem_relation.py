@@ -41,6 +41,10 @@ NAME = "workitem_relation"
 TITLE = "Work item relations"
 
 DEPENDENCY_TYPES: tuple[str, ...] = get_args(DependencyTypeEnum)
+# Plain relations, not dependencies: Plane keeps them on the relations endpoint (every
+# edition, Community included), never on the dependency one.
+PLAIN_RELATIONS = ("relates_to", "duplicate")
+RELATION_TYPES = (*DEPENDENCY_TYPES, *PLAIN_RELATIONS)
 
 _OTHER_RELATIONS = (
     "For any other relationship pass relation_definition_id and "
@@ -71,7 +75,7 @@ ACTIONS = (
 
 FOOTER = (
     "Call list_definitions first and match the user's wording to an entry. A "
-    f"built_in_dependencies value ({', '.join(DEPENDENCY_TYPES)}) goes in relation_type; a "
+    f"built_in_dependencies value ({', '.join(RELATION_TYPES)}) goes in relation_type; a "
     "custom definition needs its id in relation_definition_id and the matched outward or "
     "inward label in relation_definition_label, which sets direction."
 )
@@ -316,6 +320,7 @@ def _legacy_create(client, workspace_slug, project_id, work_item_id, relation_ty
     """
     if _legacy_relations(client, workspace_slug, project_id, work_item_id) is None:
         return None
+    source = "legacy_relations_endpoint"
     if relation_type not in LEGACY_RELATION_KINDS:
         return (
             f"Error: relation_type {relation_type!r} is not supported by this deployment's relations "
@@ -331,7 +336,12 @@ def _legacy_create(client, workspace_slug, project_id, work_item_id, relation_ty
     except HttpError as exc:
         if exc.status_code != HTTP_BAD_REQUEST:
             raise
-        return f"Error: Plane refused the {relation_type} relation: {exc}. Nothing was changed."
+        if not session.session_configured():
+            return f"Error: Plane refused the {relation_type} relation: {exc}. Nothing was changed."
+        refused = _session_create(workspace_slug, project_id, work_item_id, relation_type, targets)
+        if refused:
+            return refused
+        source = "web_session_issue_relation"
 
     after = _legacy_relations(client, workspace_slug, project_id, work_item_id) or {}
     present = set(_related_ids((after.get("dependencies") or {}).get(relation_type) or []))
@@ -339,12 +349,33 @@ def _legacy_create(client, workspace_slug, project_id, work_item_id, relation_ty
         "workitem_id": work_item_id,
         "relation_type": relation_type,
         "related_workitem_ids": [t for t in targets if t in present],
-        "source": "legacy_relations_endpoint",
+        "source": source,
     }
     not_confirmed = [t for t in targets if t not in present]
     if not_confirmed:
         result["not_confirmed"] = not_confirmed
     return result
+
+
+def _session_create(workspace_slug, project_id, work_item_id, relation_type, targets) -> str | None:
+    """Create relations through the web app's `issue-relation/` route; an error string, or None.
+
+    The fallback for when the public relations endpoint refuses a kind it should take. The
+    web route accepts every relation kind the web UI offers, relates_to included.
+    """
+    path = f"api/workspaces/{workspace_slug}/projects/{project_id}/issues/{work_item_id}/issue-relation/"
+    try:
+        response = session.get_session().post(path, {"relation_type": relation_type, "issues": targets})
+    except session.SessionSignInError as exc:
+        return f"Error: {exc} Nothing was changed."
+    if response.status_code == HTTP_FORBIDDEN:
+        return (
+            f"Error: the session user {session.get_session().email} is not allowed to edit this project. "
+            "Nothing was changed."
+        )
+    if not 200 <= response.status_code < 300:
+        return f"Error: Plane refused the {relation_type} relation: {response.text[:200]}. Nothing was changed."
+    return None
 
 
 def register(mcp: FastMCP) -> None:
@@ -386,7 +417,7 @@ def register(mcp: FastMCP) -> None:
 
         if action == "list_definitions":
             return {
-                "built_in_dependencies": list(DEPENDENCY_TYPES),
+                "built_in_dependencies": list(RELATION_TYPES),
                 "custom_definitions": [
                     d.model_dump() for d in _all_definitions(client, workspace_slug, is_default, is_active)
                 ],
@@ -455,8 +486,17 @@ def register(mcp: FastMCP) -> None:
             if not targets:
                 return missing(action, "workitem_ids")
             if relation_type:
-                if error := one_of("relation_type", relation_type, DEPENDENCY_TYPES, _OTHER_RELATIONS):
+                if error := one_of("relation_type", relation_type, RELATION_TYPES, _OTHER_RELATIONS):
                     return error
+                if relation_type in PLAIN_RELATIONS:
+                    # Not a dependency, so the dependency endpoint would refuse it on any edition.
+                    created = _legacy_create(client, workspace_slug, project_id, workitem_id, relation_type, targets)
+                    if created is None:
+                        return (
+                            f"Error: this Plane deployment has no relations endpoint, so {relation_type} "
+                            f"cannot be created here. Nothing was changed. {_OTHER_RELATIONS}"
+                        )
+                    return created
                 try:
                     return client.work_items.dependencies.create(
                         workspace_slug=workspace_slug,

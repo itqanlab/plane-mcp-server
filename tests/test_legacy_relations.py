@@ -207,7 +207,8 @@ class TestCreateFallback:
         assert out.startswith("Error:") and "Nothing was changed" in out
         assert client.created == []
 
-    def test_a_400_from_the_legacy_endpoint_is_reported_not_raised(self):
+    def test_a_400_from_the_legacy_endpoint_is_reported_not_raised(self, monkeypatch):
+        monkeypatch.delenv("PLANE_SESSION_EMAIL", raising=False)
         client = FakeRelationsClient(legacy_create_error=HttpError(status_code=400, message="Bad Request"))
         out = _legacy_create(client, "ws", "p", "wi", "blocked_by", ["a"])
         assert out.startswith("Error: Plane refused the blocked_by relation")
@@ -239,4 +240,101 @@ class TestCreateFallback:
             relation_definition_label="causes",
         )
         assert out == CUSTOM_UNAVAILABLE
+        assert client.created == []
+
+
+class FakeSession:
+    """The web session, recording posts and storing what Plane would."""
+
+    email = "bot@example.com"
+
+    def __init__(self, client, status_code=201):
+        self.client = client
+        self.status_code = status_code
+        self.posts = []
+
+    def post(self, path, payload):
+        self.posts.append((path, payload))
+        if self.status_code < 300:
+            self.client.legacy.setdefault(payload["relation_type"], []).extend(
+                {"project_id": "p", "issue_id": i} for i in payload["issues"]
+            )
+        return SimpleNamespace(status_code=self.status_code, text="refused")
+
+
+@pytest.fixture
+def web_session(monkeypatch):
+    """Session credentials configured, with a fake web session bound to the test's client."""
+    from plane_mcp import session
+
+    holder = {}
+    monkeypatch.setattr(session, "session_configured", lambda: True)
+    monkeypatch.setattr(session, "get_session", lambda: holder["session"])
+
+    def bind(client, status_code=201):
+        holder["session"] = FakeSession(client, status_code)
+        return holder["session"]
+
+    return bind
+
+
+class TestPlainRelations:
+    """relates_to and duplicate are relations, not dependencies (PMCP-23)."""
+
+    @pytest.mark.parametrize("kind", ["relates_to", "duplicate"])
+    def test_goes_straight_to_the_relations_endpoint(self, relation_tool, kind):
+        # A dependency endpoint that answers 500 proves it is never asked.
+        client = FakeRelationsClient(dependency_error=HttpError(status_code=500, message="boom"))
+        out = relation_tool(client)(
+            action="create", project_id="p", workitem_id="wi", workitem_ids=["a"], relation_type=kind
+        )
+        assert client.created == [{"relation_type": kind, "issues": ["a"]}]
+        assert out["relation_type"] == kind and out["related_workitem_ids"] == ["a"]
+        assert out["source"] == "legacy_relations_endpoint"
+
+    def test_a_refusal_falls_back_to_the_web_session(self, relation_tool, web_session):
+        client = FakeRelationsClient(legacy_create_error=HttpError(status_code=400, message="Bad Request"))
+        fake = web_session(client)
+        out = relation_tool(client)(
+            action="create", project_id="p", workitem_id="wi", workitem_ids=["a", "b"], relation_type="relates_to"
+        )
+        assert fake.posts == [
+            (
+                "api/workspaces/ws/projects/p/issues/wi/issue-relation/",
+                {"relation_type": "relates_to", "issues": ["a", "b"]},
+            )
+        ]
+        assert out["related_workitem_ids"] == ["a", "b"]
+        assert out["source"] == "web_session_issue_relation"
+
+    def test_a_web_session_refusal_is_reported(self, relation_tool, web_session):
+        client = FakeRelationsClient(legacy_create_error=HttpError(status_code=400, message="Bad Request"))
+        web_session(client, status_code=400)
+        out = relation_tool(client)(
+            action="create", project_id="p", workitem_id="wi", workitem_ids=["a"], relation_type="relates_to"
+        )
+        assert out.startswith("Error: Plane refused the relates_to relation") and "Nothing was changed" in out
+
+    def test_a_refusal_without_session_credentials_is_reported(self, relation_tool, monkeypatch):
+        monkeypatch.delenv("PLANE_SESSION_EMAIL", raising=False)
+        client = FakeRelationsClient(legacy_create_error=HttpError(status_code=400, message="Bad Request"))
+        out = relation_tool(client)(
+            action="create", project_id="p", workitem_id="wi", workitem_ids=["a"], relation_type="relates_to"
+        )
+        assert out.startswith("Error: Plane refused the relates_to relation")
+
+    def test_no_relations_endpoint_is_a_clear_error(self, relation_tool):
+        client = FakeRelationsClient(legacy=HttpError(status_code=404, message="Not Found"))
+        out = relation_tool(client)(
+            action="create", project_id="p", workitem_id="wi", workitem_ids=["a"], relation_type="relates_to"
+        )
+        assert out.startswith("Error:") and "no relations endpoint" in out
+        assert client.created == []
+
+    def test_an_unknown_kind_is_still_refused(self, relation_tool):
+        client = FakeRelationsClient()
+        out = relation_tool(client)(
+            action="create", project_id="p", workitem_id="wi", workitem_ids=["a"], relation_type="causes"
+        )
+        assert out.startswith("Error: relation_type must be one of") and "relates_to" in out
         assert client.created == []
