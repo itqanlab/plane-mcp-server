@@ -33,4 +33,6 @@ items always belong to a project; ask which if one is not named.
    `workitem delete` by work item id (set parent=<work item id> to nest).
 5. List an epic's children: `workitem list` with pql='childOf("<EPIC-IDENTIFIER>")'
    using the epic's human-readable identifier (e.g. "PROJ-12") from `workitem retrieve`.
+The same steps work on Plane Community, which has no types: resolve returns a
+"label:<uuid>" id for the project's Epic label, and create, update and list treat it as the type.
 """

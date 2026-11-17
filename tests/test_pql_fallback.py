@@ -37,7 +37,7 @@ class TestParse:
         [
             'state = "a" OR priority = "b"',  # OR not evaluated
             "assignee = currentUser()",  # function call
-            'labels = "x"',  # field we refuse to guess at
+            'assignee = "x"',  # field we refuse to guess at
             "",
         ],
     )

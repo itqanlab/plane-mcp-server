@@ -30,6 +30,7 @@ from plane_mcp.toolkit import (
     workspace_owns,
     workspace_owns_resource,
 )
+from plane_mcp.toolkit.label_types import EPIC, TYPES_UNAVAILABLE, resolve_epic_label
 
 NAME = "workitem_type"
 TITLE = "Work item types"
@@ -60,12 +61,12 @@ ACTIONS = (
 )
 
 FOOTER = (
-    "Omit project_id to work at workspace scope. A type's id is the type_id for `workitem create` "
+    "Omit project_id for workspace scope. A type's id is the type_id for `workitem create` "
     "and the workitem_type_id for `workitem_property list`. "
-    "Prefer resolve over create when you just need a usable type such as Epic or Initiative: it "
-    "handles both modes, matches exactly (case-sensitive, whitespace-stripped) and never "
-    "duplicates. Where the workspace owns the vocabulary, creating a type on a project is "
-    "rejected and importing is the only valid path -- resolve does that for you."
+    "Prefer resolve over create for a usable type such as Epic: it handles both scopes, matches "
+    "exactly (case-sensitive, whitespace-stripped), never duplicates, and imports the type where "
+    "the workspace owns the vocabulary. "
+    'With no types API (Community), resolve name=Epic returns "label:<uuid>", usable as a type.'
 )
 
 LEGACY = {
@@ -88,6 +89,21 @@ def _scope_of(client: Any, project_id: str) -> tuple[Any, dict[str, Any], str]:
 
 def _named(types, target: str):
     return next((t for t in types if (t.name or "").strip() == target), None)
+
+
+HTTP_NOT_FOUND = 404
+
+
+def _resolve_or_fall_back(client, workspace_slug: str, project_id: str, name: str) -> Any:
+    """`_resolve`, or the Epic label where the edition does not serve types at all."""
+    try:
+        return _resolve(client, workspace_slug, project_id, name)
+    except HttpError as exc:
+        if exc.status_code != HTTP_NOT_FOUND:
+            raise
+    if name.strip().lower() == EPIC.lower():
+        return resolve_epic_label(client, workspace_slug, project_id)
+    return TYPES_UNAVAILABLE.format(name=name.strip())
 
 
 # Read out of a features dict and echoed as the refusal's key, so nothing type-checks it.
@@ -158,7 +174,7 @@ def register(mcp: FastMCP) -> None:
         external_id: str = "",
         cursor: str = "",
         per_page: int = 0,
-    ) -> WorkItemType | list[WorkItemType] | str | None:
+    ) -> WorkItemType | list[WorkItemType] | dict[str, Any] | str | None:
         client, workspace_slug = get_plane_client_context()
         types, scope, id_kwarg = _scope_of(client, project_id)
 
@@ -170,7 +186,7 @@ def register(mcp: FastMCP) -> None:
         if action == "resolve":
             if error := needs(action, project_id=project_id, name=name):
                 return error
-            return _resolve(client, workspace_slug, project_id, name)
+            return _resolve_or_fall_back(client, workspace_slug, project_id, name)
 
         if action == "import_to_project":
             ids = coerce_list(workitem_type_ids)
