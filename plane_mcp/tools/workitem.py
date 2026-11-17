@@ -46,14 +46,17 @@ from plane_mcp.toolkit import (
     rich_text,
 )
 from plane_mcp.toolkit.identifiers import resolve_workitem, split_identifier
+from plane_mcp.toolkit.label_types import is_label_type, label_of, label_type_pql
 from plane_mcp.toolkit.paging import dump_results
 from plane_mcp.toolkit.pql_fallback import (
+    Unevaluable,
     apply_fallback,
     clause_columns,
     count_board,
     edition_refuses_pql,
     filter_board,
     missing_fields,
+    rewrite_child_of,
 )
 from plane_mcp.toolkit.text import DEFAULT_BODY_CHARS, ESCAPED_WARNING, looks_escaped, plain_text, truncate
 from plane_mcp.toolkit.triage import (
@@ -543,6 +546,21 @@ def register(mcp: FastMCP) -> None:
             dates = {"start_date": start_date, "target_date": target_date}
             return supplied | {field: None for field, value in dates.items() if value is None}
 
+        # An epic on an edition with no types is a label (see label_types): its type reads as one.
+        pql = label_type_pql(pql)
+
+        def client_pql(text: str) -> str | dict[str, Any]:
+            """The pql the client-side filter evaluates: childOf("PROJ-N") as parent = "<uuid>"."""
+
+            def parent_id(identifier: str) -> str:
+                found = resolve_workitem(client, workspace_slug, identifier)
+                return found if isinstance(found, str) else found[1]
+
+            try:
+                return rewrite_child_of(text, parent_id)
+            except Unevaluable as exc:
+                return {"error": f"childOf cannot be evaluated: {exc}."}
+
         if action in ("list", "list_archived"):
             if action == "list_archived" and not project_id:
                 return missing(action, "project_id")
@@ -578,6 +596,9 @@ def register(mcp: FastMCP) -> None:
                 if failure and action == "list" and project_id and edition_refuses_pql(failure["error"]):
                     # Community 1.4+ refuses pql outright. Plane's own advice is to filter
                     # client-side, so do it here rather than make every caller re-implement it.
+                    local = client_pql(pql)
+                    if isinstance(local, dict):
+                        return local
                     return filter_board(
                         lambda page_cursor: client.work_items.list(
                             workspace_slug=workspace_slug,
@@ -585,7 +606,7 @@ def register(mcp: FastMCP) -> None:
                             params=WorkItemQueryParams(per_page=100, cursor=page_cursor, expand=opt(expand)),
                         ),
                         lambda: client.states.list(workspace_slug=workspace_slug, project_id=project_id).results,
-                        pql,
+                        local,
                         opt(fields),
                         dump_results,
                         order_by=opt(order_by),
@@ -605,7 +626,10 @@ def register(mcp: FastMCP) -> None:
                 # Some deployments (Plane Community) do not reject an unsupported `pql` —
                 # they return HTTP 200 with the whole board. Left alone, a dropped filter is
                 # indistinguishable from one that matched everything. Check, and say so.
-                outcome = apply_fallback(pql, page["results"])
+                local = client_pql(pql)
+                if isinstance(local, dict):
+                    return local
+                outcome = apply_fallback(local, page["results"])
                 page["results"] = outcome["rows"]
                 page["pql_applied"] = outcome["applied"]
                 if outcome.get("warning"):
@@ -631,6 +655,9 @@ def register(mcp: FastMCP) -> None:
                 refused = failure is not None and edition_refuses_pql(failure["error"])
                 if project_id and (exc.status_code == 404 or refused):  # noqa: PLR2004
                     # Community has no count endpoint (404) and refuses pql: count here.
+                    local = client_pql(pql)
+                    if isinstance(local, dict):
+                        return local
                     return count_board(
                         lambda page_cursor, page_fields: client.work_items.list(
                             workspace_slug=workspace_slug,
@@ -638,7 +665,7 @@ def register(mcp: FastMCP) -> None:
                             params=WorkItemQueryParams(per_page=100, cursor=page_cursor, fields=page_fields),
                         ),
                         lambda: client.states.list(workspace_slug=workspace_slug, project_id=project_id).results,
-                        pql,
+                        local,
                         group_by,
                         dump_results,
                     )
@@ -708,6 +735,18 @@ def register(mcp: FastMCP) -> None:
                 state = _state_id(state, state_names)
                 if state.startswith("Error:"):
                     return state
+            if is_label_type(type_id):
+                # A label-backed epic (no types on this edition): the type is the Epic label.
+                epic_label = label_of(type_id)
+                type_id = ""
+                current = coerce_list(labels)
+                if current is None and action == "update":
+                    current = ids_of(
+                        client.work_items.retrieve(
+                            workspace_slug=workspace_slug, project_id=project_id, work_item_id=workitem_id
+                        ).labels
+                    )
+                labels = [*(current or []), *([] if epic_label in (current or []) else [epic_label])]
             if assignees:
                 resolved_assignees = _assignee_ids(client, workspace_slug, project_id, coerce_list(assignees) or [])
                 if isinstance(resolved_assignees, str):

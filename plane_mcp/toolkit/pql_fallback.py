@@ -31,9 +31,11 @@ Deliberately small, covering the filters that matter for scheduling work:
     ... AND ...
 
 Fields: ``state``, ``priority``, ``type_id``, ``parent``, ``project``, ``sequence_id``,
-``is_draft``, and the dates ``updated_at`` and ``created_at``. Anything else, and any
-``OR``/function call, is treated as unevaluable — which downgrades to the honest
-"unverified" path rather than a wrong answer.
+``is_draft``, ``label`` (true when the row carries the label), and the dates ``updated_at``
+and ``created_at``. ``childOf("PROJ-N")`` is turned into ``parent = "<uuid>"`` by the
+caller before it gets here (see ``rewrite_child_of``). Anything else, and any ``OR``/other
+function call, is treated as unevaluable — which downgrades to the honest "unverified"
+path rather than a wrong answer.
 """
 
 from __future__ import annotations
@@ -49,6 +51,10 @@ from typing import Any
 # tickets untouched for 14 days" one call:
 #     state NOT IN ("Done", "Cancelled") AND updated_at < "<today minus 14 days>"
 DATE_FIELDS = {"updated_at", "created_at"}
+# A row carries a list of labels; `label = "x"` asks whether x is among them. PQL names
+# the field `label`, the row names it `labels`, and clauses use the row's name.
+LIST_FIELDS = {"labels"}
+FIELD_ALIASES = {"label": "labels"}
 EVALUABLE_FIELDS = {
     "state",
     "priority",
@@ -57,6 +63,7 @@ EVALUABLE_FIELDS = {
     "project",
     "sequence_id",
     "is_draft",
+    *LIST_FIELDS,
     *DATE_FIELDS,
 }
 _COMPARE = {"<=": operator.le, ">=": operator.ge, "<": operator.lt, ">": operator.gt}
@@ -125,7 +132,7 @@ def parse(pql: str) -> list[tuple[str, str, list[str]]]:
         m = _CLAUSE.match(part)
         if not m:
             raise Unevaluable(f"unparsed clause: {part.strip()!r}")
-        field = m.group("field")
+        field = FIELD_ALIASES.get(m.group("field"), m.group("field"))
         if field not in EVALUABLE_FIELDS:
             raise Unevaluable(f"field not evaluable client-side: {field}")
         op = re.sub(r"\s+", " ", m.group("op").strip().upper())
@@ -147,11 +154,25 @@ def _row_value(row: dict[str, Any], field: str) -> str | None:
     return str(v)
 
 
+def _row_ids(row: dict[str, Any], field: str) -> set[str]:
+    """The ids in a list column, which holds bare ids or expanded objects."""
+    ids = set()
+    for entry in row.get(field) or []:
+        value = entry.get("id") if isinstance(entry, dict) else getattr(entry, "id", entry)
+        if value:
+            ids.add(str(value))
+    return ids
+
+
 def matches(row: dict[str, Any], clauses: list[tuple[str, str, list[str]]]) -> bool:
     for field, op, values in clauses:
         got = _row_value(row, field)
         vals = [str(v) for v in values]
-        if op in COMPARISONS:
+        if field in LIST_FIELDS:
+            carried = not _row_ids(row, field).isdisjoint(vals)
+            if carried != (op in ("=", "IN")):
+                return False
+        elif op in COMPARISONS:
             moment, bound = as_datetime(row.get(field)), as_datetime(values[0])
             if moment is None or bound is None or not _COMPARE[op](moment, bound):
                 return False
@@ -224,6 +245,27 @@ def apply_fallback(pql: str, rows: list[dict[str, Any]]) -> dict[str, Any]:
 EDITION_REFUSAL = "not supported on this plane edition"
 _UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.IGNORECASE)
 MAX_PAGES = 50  # 100 rows a page: a 5,000-item project is still one call
+
+
+CHILD_OF = re.compile(r"""\bchildOf\(\s*(["'])(?P<ref>[^"']+)\1\s*\)""", re.IGNORECASE)
+
+
+def rewrite_child_of(pql: str, resolve) -> str:
+    """`childOf("PROJ-N")` as `parent = "<uuid>"`, the one function the client side can answer.
+
+    A child is a row whose parent is that work item, so the function is a plain equality on
+    a column every row carries. `resolve(identifier) -> uuid | "Error: ..."` looks up a
+    PROJ-N (a uuid passes through); an unknown identifier raises Unevaluable with its error.
+    """
+
+    def replace(match: re.Match) -> str:
+        ref = match.group("ref").strip()
+        found = ref if _UUID.match(ref) else resolve(ref)
+        if str(found).startswith("Error:"):
+            raise Unevaluable(str(found).removeprefix("Error: ").rstrip("."))
+        return f'parent = "{found}"'
+
+    return CHILD_OF.sub(replace, pql or "")
 
 
 def edition_refuses_pql(detail: Any) -> bool:
@@ -328,7 +370,8 @@ def filter_board(
             f"evaluated client-side ({exc}).",
             "supported_here": 'field = "v", field != "v", field IN ("a","b"), NOT IN, joined by AND; '
             'dates take <, <=, >, >= "2026-09-18". Fields: ' + ", ".join(sorted(EVALUABLE_FIELDS)) + ". "
-            'state accepts a name, e.g. state = "Todo".',
+            'state accepts a name, e.g. state = "Todo". label = "<uuid>" matches rows carrying that label. '
+            'childOf("PROJ-N") is the only function.',
         }
     if any(field == "state" for field, _, _ in clauses):
         names = {str(s.name).lower(): str(s.id) for s in list_states()}
@@ -388,6 +431,7 @@ def group_field(group_by: str) -> str:
 
 def clause_columns(pql: str) -> list[str]:
     """The row columns a pql's clauses read; empty when the pql is not evaluable here."""
+    pql = CHILD_OF.sub('parent = "-"', pql or "")  # the columns only; nothing is looked up
     try:
         return sorted({f for f, _, _ in parse(pql)}) if pql and pql.strip() else []
     except Unevaluable:
