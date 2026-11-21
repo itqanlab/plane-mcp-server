@@ -190,6 +190,41 @@ GROUP_BY_VALUES = (
 # board to decide what to pick needs none of that: 20 rows were 75 KB measured on a live
 # board. List rows are compact unless the caller asks, and writes confirm instead of echoing.
 COMPACT_ROW = "id,sequence_id,name,state,priority,parent,labels,assignees,target_date,updated_at"
+
+
+def external_lookup(get: Any, path: str, external_source: str, external_id: str, fields: str | None) -> dict[str, Any]:
+    """One project's work item by external_source + external_id, as a one-row (or empty) list.
+
+    With both params Plane answers the single item, or 404, instead of a page, so the SDK's
+    `work_items.list()` fails PaginatedWorkItemResponse validation on every match (PMCP-24;
+    the SDK always validates a page, a plane-python-sdk issue). Read it raw instead.
+    """
+    try:
+        raw = get(path, params={"external_source": external_source, "external_id": external_id})
+    except HttpError as exc:
+        if exc.status_code == 404:  # noqa: PLR2004
+            raw = None
+        else:
+            raise
+    if isinstance(raw, dict) and isinstance(raw.get("results"), list):
+        rows = raw["results"]
+    elif isinstance(raw, dict) and raw.get("id"):
+        rows = [raw]
+    else:
+        rows = []
+    if fields:
+        keep = {f.strip() for f in fields.split(",") if f.strip()}
+        rows = [{k: v for k, v in row.items() if k in keep} for row in rows]
+    return {
+        "results": rows,
+        "count": len(rows),
+        "total_count": len(rows),
+        "next_cursor": None,
+        "next_page_results": False,
+        "lookup": "external_id",
+    }
+
+
 WRITE_ECHO = ("id", "sequence_id", "name", "state", "priority", "parent", "updated_at")
 
 
@@ -565,6 +600,20 @@ def register(mcp: FastMCP) -> None:
             if action == "list_archived" and not project_id:
                 return missing(action, "project_id")
             fields = "" if fields == "all" else (fields or COMPACT_ROW)
+            if action == "list" and (external_id or external_source):
+                if not (external_id and external_source):
+                    return missing(action, "both external_source and external_id (a lookup needs the pair)")
+                if not project_id:
+                    return missing(action, "project_id (an external id is looked up within one project)")
+                if pql:
+                    return {"error": "pass either pql or external_source + external_id, not both"}
+                return external_lookup(
+                    client.work_items._get,
+                    f"{workspace_slug}/projects/{project_id}/work-items",
+                    external_source,
+                    external_id,
+                    opt(fields),
+                )
             # The pql check below reads the clause columns off every row, so ask the server for
             # them too, then hand back only the columns the caller asked for.
             asked = fields
