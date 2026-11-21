@@ -63,6 +63,8 @@ EVALUABLE_FIELDS = {
     "project",
     "sequence_id",
     "is_draft",
+    "external_source",
+    "external_id",
     *LIST_FIELDS,
     *DATE_FIELDS,
 }
